@@ -25,18 +25,30 @@ class RuntimeState:
         self.best_provider: switch.Provider | None = None
         self.last_probe_error: str | None = None
         self.last_probe_time_unix: float | None = None
+        self.last_probe_latency_ms: float | None = None
 
     def set_probe_result(
-        self, provider: switch.Provider | None, error: str | None = None
+        self,
+        provider: switch.Provider | None,
+        error: str | None = None,
+        latency_ms: float | None = None,
     ) -> None:
         with self._lock:
             self.best_provider = provider
             self.last_probe_error = error
             self.last_probe_time_unix = time.time()
+            self.last_probe_latency_ms = latency_ms
 
-    def snapshot(self) -> tuple[switch.Provider | None, str | None, float | None]:
+    def snapshot(
+        self,
+    ) -> tuple[switch.Provider | None, str | None, float | None, float | None]:
         with self._lock:
-            return self.best_provider, self.last_probe_error, self.last_probe_time_unix
+            return (
+                self.best_provider,
+                self.last_probe_error,
+                self.last_probe_time_unix,
+                self.last_probe_latency_ms,
+            )
 
 
 APP_STATE = RuntimeState()
@@ -109,7 +121,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--menubar",
         action="store_true",
-        help="Enable optional macOS menubar status app (requires rumps + GUI session).",
+        help=(
+            "Enable macOS menubar status app (default behavior). "
+            "Kept for compatibility."
+        ),
+    )
+    parser.add_argument(
+        "--headless",
+        action="store_true",
+        help="Disable menubar and run proxy server only.",
     )
     return parser.parse_args()
 
@@ -140,10 +160,14 @@ def run_probe_once() -> switch.ProbeSummary | None:
     ranked = switch.rank_summaries(summaries)
     selected = next((item for item in ranked if item.is_healthy), None)
     if selected:
-        APP_STATE.set_probe_result(selected.provider, None)
+        APP_STATE.set_probe_result(
+            selected.provider, None, latency_ms=selected.median_latency_ms
+        )
     else:
         errors = [item.last_error for item in ranked if item.last_error]
-        APP_STATE.set_probe_result(None, errors[0] if errors else "No healthy provider.")
+        APP_STATE.set_probe_result(
+            None, errors[0] if errors else "No healthy provider.", latency_ms=None
+        )
     return selected
 
 
@@ -155,7 +179,7 @@ def prober_loop() -> None:
                 median = int(result.median_latency_ms) if result.median_latency_ms else "?"
                 print(f"[probe] selected={result.provider.name} latency={median}ms", flush=True)
             else:
-                _, err, _ = APP_STATE.snapshot()
+                _, err, _, _ = APP_STATE.snapshot()
                 print(f"[probe] no healthy provider: {err}", flush=True)
         except Exception as err:  # pragma: no cover
             APP_STATE.set_probe_result(None, f"Probe exception: {type(err).__name__}: {err}")
@@ -165,9 +189,8 @@ def prober_loop() -> None:
 
 def _sanitize_response_headers(headers: httpx.Headers) -> dict[str, str]:
     out = dict(headers)
-    out.pop("content-encoding", None)
-    out.pop("content-length", None)
     out.pop("transfer-encoding", None)
+    out.pop("connection", None)
     return out
 
 
@@ -184,12 +207,13 @@ async def _proxy_stream_generator(
 
 @app.get("/_health")
 async def health() -> JSONResponse:
-    provider, err, ts = APP_STATE.snapshot()
+    provider, err, ts, latency_ms = APP_STATE.snapshot()
     payload = {
         "best_provider": provider.name if provider else None,
         "base_url": provider.base_url if provider else None,
         "last_probe_error": err,
         "last_probe_time_unix": ts,
+        "last_probe_latency_ms": latency_ms,
     }
     return JSONResponse(payload)
 
@@ -198,7 +222,7 @@ async def health() -> JSONResponse:
     "/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"]
 )
 async def proxy_handler(request: Request, path: str):
-    provider, err, _ = APP_STATE.snapshot()
+    provider, err, _, _ = APP_STATE.snapshot()
     if not provider:
         return JSONResponse(
             {
@@ -217,6 +241,7 @@ async def proxy_handler(request: Request, path: str):
     headers = dict(request.headers)
     headers.pop("host", None)
     headers.pop("content-length", None)
+    headers["accept-encoding"] = "identity"
     if provider.use_header_key:
         headers[provider.header_key_name] = provider.api_key
 
@@ -239,12 +264,12 @@ async def proxy_handler(request: Request, path: str):
     )
 
 
-def run_optional_menubar() -> None:
+def run_optional_menubar() -> bool:
     try:
         import rumps
     except Exception as err:
         print(f"[menubar] disabled: failed to import rumps ({err})", flush=True)
-        return
+        return False
 
     class ProxyMenuBarApp(rumps.App):
         def __init__(self):
@@ -255,11 +280,16 @@ def run_optional_menubar() -> None:
                 rumps.MenuItem("Status in terminal", callback=None),
             ]
             self._refresh_title()
+            self._timer = rumps.Timer(self._refresh_title, 2)
+            self._timer.start()
 
-        def _refresh_title(self):
-            provider, err, _ = APP_STATE.snapshot()
+        def _refresh_title(self, _=None):
+            provider, err, _, latency_ms = APP_STATE.snapshot()
             if provider:
-                self.title = f"🤖 {provider.name}"
+                if latency_ms is not None:
+                    self.title = f"🤖 {provider.name} ({int(latency_ms)}ms)"
+                else:
+                    self.title = f"🤖 {provider.name}"
             elif err:
                 self.title = "🤖 Error"
             else:
@@ -269,7 +299,16 @@ def run_optional_menubar() -> None:
             run_probe_once()
             self._refresh_title()
 
-    ProxyMenuBarApp().run()
+    try:
+        ProxyMenuBarApp().run()
+        return True
+    except Exception as err:
+        print(f"[menubar] disabled: runtime error ({err})", flush=True)
+        return False
+
+
+def run_uvicorn_server(host: str, port: int) -> None:
+    uvicorn.run(app, host=host, port=port, log_level="info")
 
 
 def main() -> int:
@@ -282,6 +321,11 @@ def main() -> int:
     global PROBE_CA_FILE
 
     args = parse_args()
+    if args.headless and args.menubar:
+        print("Use only one of --headless or --menubar.")
+        return 2
+
+    menubar_enabled = not args.headless
     if args.probe_interval <= 0:
         print("--probe-interval must be > 0")
         return 2
@@ -315,10 +359,18 @@ def main() -> int:
     run_probe_once()
     threading.Thread(target=prober_loop, daemon=True).start()
 
-    if args.menubar:
-        threading.Thread(target=run_optional_menubar, daemon=True).start()
+    if menubar_enabled:
+        print("[menubar] enabled (default mode).", flush=True)
+        # rumps must run on the main thread.
+        threading.Thread(
+            target=run_uvicorn_server, args=(args.host, args.port), daemon=True
+        ).start()
+        menubar_started = run_optional_menubar()
+        if menubar_started:
+            return 0
+        print("[menubar] falling back to headless server mode.", flush=True)
 
-    uvicorn.run(app, host=args.host, port=args.port, log_level="info")
+    run_uvicorn_server(args.host, args.port)
     return 0
 
 
