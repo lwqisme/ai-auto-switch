@@ -1,0 +1,4 @@
+__pycache__/
+.vscode/
+providers.json
+.DS_Store

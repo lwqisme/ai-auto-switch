@@ -1,0 +1,22 @@
+{
+  "providers": [
+    {
+      "name": "yunwu-main",
+      "base_url": "https://yunwu.ai",
+      "api_key_env": "YUNWU_MAIN_API_KEY",
+      "model": "gemini-3-flash-preview",
+      "session_model": "gemini-3-pro-preview",
+      "cheap_only": true,
+      "expensive_only": false
+    },
+    {
+      "name": "relay-backup",
+      "base_url": "https://example-relay.ai",
+      "api_key_env": "RELAY_BACKUP_API_KEY",
+      "model": "gemini-3-flash-preview",
+      "session_model": "gemini-3-pro-preview",
+      "cheap_only": false,
+      "expensive_only": true
+    }
+  ]
+}
