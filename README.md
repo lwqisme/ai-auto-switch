@@ -120,6 +120,67 @@ Write selected values into an env file:
 python3 switch.py --config providers.json --write-env ~/.gemini/.env
 ```
 
+## proxy_app.py (local proxy)
+
+Install proxy runtime dependencies first:
+
+```bash
+python3 -m pip install --user -r requirements.txt
+```
+
+Default run (detached background process, menubar mode by default):
+
+```bash
+python3 proxy_app.py
+```
+
+- Log file default: `/tmp/ai-auto-switch-proxy.log`
+- Foreground mode (stay attached to terminal):
+
+```bash
+python3 proxy_app.py --foreground
+```
+
+- Probe strategy in proxy mode:
+  - Probe cheap providers first.
+  - Run expensive probe stage only if all cheap results fail or are slower than `5000ms`.
+- Optional tuning:
+
+```bash
+python3 proxy_app.py --probe-expensive-threshold-ms 5000 --probe-expensive-attempts 1
+```
+
+- Default logs are concise status lines:
+  - `[probe-stage][cheap] WORKING healthy=3/7 fastest=uniapi-0.5 (1481.5ms)`
+  - `[probe-stage][cheap] 01 yunwu-1=WORKING latency=1556.0ms`
+  - `[probe-stage][cheap] 05 yunwu-2=NOT_WORKING latency=2101.3ms reason=HTTP 500: quota error ...`
+  - `[probe-stage][expensive] SKIPPED reason=cheap_healthy_within_threshold threshold=5000.0ms`
+  - `[probe-status] WORKING selected=uniapi-0.5 source=cheap latency=1481.5ms`
+  - `[probe-status] NOT_WORKING reason=...`
+- Enable per-provider details only when needed:
+
+```bash
+python3 proxy_app.py --probe-detail
+```
+
+If `rumps` is missing, the process logs a notice and falls back to headless mode. Install it with:
+
+```bash
+python3 -m pip install --user rumps
+```
+
+Headless-only run:
+
+```bash
+python3 proxy_app.py --headless
+```
+
+Health check:
+
+```bash
+curl -sS http://127.0.0.1:8080/_health
+```
+
 ## Optional per-provider fields
 
 - `test_path` (optional, overrides model-based probe URL)

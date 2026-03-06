@@ -73,6 +73,7 @@ class ProbeSummary:
     attempts: int
     success_count: int
     latencies_ms: list[float]
+    attempt_latencies_ms: list[float]
     last_error: str | None
 
     @property
@@ -80,6 +81,12 @@ class ProbeSummary:
         if not self.latencies_ms:
             return None
         return float(statistics.median(self.latencies_ms))
+
+    @property
+    def median_attempt_latency_ms(self) -> float | None:
+        if not self.attempt_latencies_ms:
+            return None
+        return float(statistics.median(self.attempt_latencies_ms))
 
     @property
     def is_healthy(self) -> bool:
@@ -451,17 +458,21 @@ def probe_once(
             elapsed_ms = (time.perf_counter() - start) * 1000.0
             if 200 <= status < 300:
                 return True, elapsed_ms, None
-            return False, None, f"HTTP {status}"
+            return False, elapsed_ms, f"HTTP {status}"
     except urllib.error.HTTPError as err:
+        elapsed_ms = (time.perf_counter() - start) * 1000.0
         body = err.read(120).decode("utf-8", errors="ignore").strip()
         extra = f": {body}" if body else ""
-        return False, None, f"HTTP {err.code}{extra}"
+        return False, elapsed_ms, f"HTTP {err.code}{extra}"
     except urllib.error.URLError as err:
-        return False, None, f"URL error: {err.reason}"
+        elapsed_ms = (time.perf_counter() - start) * 1000.0
+        return False, elapsed_ms, f"URL error: {err.reason}"
     except TimeoutError:
-        return False, None, "Timeout"
+        elapsed_ms = (time.perf_counter() - start) * 1000.0
+        return False, elapsed_ms, "Timeout"
     except Exception as err:  # pragma: no cover - conservative fallback
-        return False, None, f"{type(err).__name__}: {err}"
+        elapsed_ms = (time.perf_counter() - start) * 1000.0
+        return False, elapsed_ms, f"{type(err).__name__}: {err}"
 
 
 def probe_provider(
@@ -473,6 +484,7 @@ def probe_provider(
     deadline: float | None,
 ) -> ProbeSummary:
     latencies: list[float] = []
+    attempt_latencies: list[float] = []
     last_error: str | None = None
     success_count = 0
 
@@ -487,9 +499,12 @@ def probe_provider(
             attempt_timeout = timeout_s
 
         ok, latency_ms, error = probe_once(provider, attempt_timeout, insecure, ca_file)
-        if ok and latency_ms is not None:
+        if latency_ms is not None:
+            attempt_latencies.append(latency_ms)
+        if ok:
             success_count += 1
-            latencies.append(latency_ms)
+            if latency_ms is not None:
+                latencies.append(latency_ms)
         else:
             last_error = error or "Unknown error"
 
@@ -498,6 +513,7 @@ def probe_provider(
         attempts=attempts,
         success_count=success_count,
         latencies_ms=latencies,
+        attempt_latencies_ms=attempt_latencies,
         last_error=last_error,
     )
 
@@ -508,6 +524,7 @@ def make_skipped_summary(provider: Provider, attempts: int, reason: str) -> Prob
         attempts=attempts,
         success_count=0,
         latencies_ms=[],
+        attempt_latencies_ms=[],
         last_error=reason,
     )
 
@@ -567,9 +584,16 @@ def probe_all_providers_parallel(
 
 
 def rank_summaries(summaries: list[ProbeSummary]) -> list[ProbeSummary]:
-    def sort_key(item: ProbeSummary) -> tuple[int, float]:
-        median = item.median_latency_ms if item.median_latency_ms is not None else float("inf")
-        return (-item.success_count, median)
+    def sort_key(item: ProbeSummary) -> tuple[int, float, float]:
+        median_success = (
+            item.median_latency_ms if item.median_latency_ms is not None else float("inf")
+        )
+        median_attempt = (
+            item.median_attempt_latency_ms
+            if item.median_attempt_latency_ms is not None
+            else float("inf")
+        )
+        return (-item.success_count, median_success, median_attempt)
 
     return sorted(summaries, key=sort_key)
 
@@ -630,10 +654,16 @@ def print_human_results(
             if summary.median_latency_ms is not None
             else "-"
         )
+        attempt_median = (
+            f"{summary.median_attempt_latency_ms:.1f} ms"
+            if summary.median_attempt_latency_ms is not None
+            else "-"
+        )
         error = f", last_error={summary.last_error}" if summary.last_error else ""
         print(
             f"- {summary.provider.name}: {health}, success={summary.success_count}/{summary.attempts}, "
-            f"median={median}, method={summary.provider.test_method}, model={summary.provider.model}{error}"
+            f"median={median}, attempt_median={attempt_median}, "
+            f"method={summary.provider.test_method}, model={summary.provider.model}{error}"
         )
 
     if selected:
@@ -660,6 +690,8 @@ def serialize_summary(item: ProbeSummary) -> dict[str, Any]:
         "success_count": item.success_count,
         "attempts": item.attempts,
         "median_latency_ms": item.median_latency_ms,
+        "median_attempt_latency_ms": item.median_attempt_latency_ms,
+        "attempt_latencies_ms": item.attempt_latencies_ms,
         "last_error": item.last_error,
     }
 
