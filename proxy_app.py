@@ -1,9 +1,15 @@
 import argparse
+import concurrent.futures
+import json
+import re
 import subprocess
 import sys
 import threading
 import time
+from datetime import datetime
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 import httpx
 import uvicorn
@@ -15,65 +21,70 @@ import switch
 DEFAULT_CONFIG_PATH = Path(__file__).with_name("providers.json")
 DEFAULT_PROXY_HOST = "127.0.0.1"
 DEFAULT_PROXY_PORT = 8080
-DEFAULT_PROBE_INTERVAL_SECONDS = 900.0
+DEFAULT_PROBE_INTERVAL_SECONDS = 600.0
 DEFAULT_PROBE_ATTEMPTS = 1
 DEFAULT_PROBE_TIMEOUT_SECONDS = 5.0
 DEFAULT_PROBE_TOTAL_TIMEOUT_SECONDS = 10.0
-DEFAULT_PROBE_EXPENSIVE_ATTEMPTS = switch.DEFAULT_EXPENSIVE_ATTEMPTS
-DEFAULT_PROBE_EXPENSIVE_THRESHOLD_MS = switch.DEFAULT_EXPENSIVE_THRESHOLD_MS
+DEFAULT_SCORE_ALPHA = 0.7
+DEFAULT_STICKY_IMPROVEMENT_THRESHOLD = 0.2
+DEFAULT_LATENCY_WINDOW = 5
+DEFAULT_FAILURE_THRESHOLD = 2
 DEFAULT_BACKGROUND_LOG_FILE = "/tmp/ai-auto-switch-proxy.log"
+DEFAULT_PROXY_ENV_FILE = switch.DEFAULT_GEMINI_ENV_FILE
 RUMPS_INSTALL_CMD = "python3 -m pip install --user rumps"
 
-
-class RuntimeState:
-    def __init__(self) -> None:
-        self._lock = threading.Lock()
-        self.best_provider: switch.Provider | None = None
-        self.last_probe_error: str | None = None
-        self.last_probe_time_unix: float | None = None
-        self.last_probe_latency_ms: float | None = None
-
-    def set_probe_result(
-        self,
-        provider: switch.Provider | None,
-        error: str | None = None,
-        latency_ms: float | None = None,
-    ) -> None:
-        with self._lock:
-            self.best_provider = provider
-            self.last_probe_error = error
-            self.last_probe_time_unix = time.time()
-            self.last_probe_latency_ms = latency_ms
-
-    def snapshot(
-        self,
-    ) -> tuple[switch.Provider | None, str | None, float | None, float | None]:
-        with self._lock:
-            return (
-                self.best_provider,
-                self.last_probe_error,
-                self.last_probe_time_unix,
-                self.last_probe_latency_ms,
-            )
+RETRYABLE_LIVE_STATUS_CODES = {408, 409, 425, 429, 500, 502, 503, 504}
+HTTP_STATUS_PATTERN = re.compile(r"HTTP\s+(\d{3})")
 
 
-APP_STATE = RuntimeState()
-PROVIDERS: list[switch.Provider] = []
+@dataclass
+class ProviderRuntime:
+    provider: switch.Provider
+    input_price: float
+    is_healthy: bool = False
+    consecutive_failures: int = 0
+    last_error: str | None = None
+    last_probe_latency_ms: float | None = None
+    moving_avg_latency_ms: float | None = None
+    balance_score: float | None = None
+    success_latencies_ms: list[float] = field(default_factory=list)
+    last_probe_time_unix: float | None = None
+
+
+RUNTIME_LOCK = threading.Lock()
+RUNTIME_BY_NAME: dict[str, ProviderRuntime] = {}
+RUNTIME_ORDER: list[str] = []
+ACTIVE_PROVIDER_NAME: str | None = None
+LAST_PROBE_ERROR: str | None = None
+LAST_PROBE_TIME_UNIX: float | None = None
+
 PROBE_INTERVAL_SECONDS = DEFAULT_PROBE_INTERVAL_SECONDS
 PROBE_ATTEMPTS = DEFAULT_PROBE_ATTEMPTS
 PROBE_TIMEOUT_SECONDS = DEFAULT_PROBE_TIMEOUT_SECONDS
 PROBE_TOTAL_TIMEOUT_SECONDS = DEFAULT_PROBE_TOTAL_TIMEOUT_SECONDS
-PROBE_EXPENSIVE_ATTEMPTS = DEFAULT_PROBE_EXPENSIVE_ATTEMPTS
-PROBE_EXPENSIVE_THRESHOLD_MS = DEFAULT_PROBE_EXPENSIVE_THRESHOLD_MS
 PROBE_DETAIL = False
 PROBE_INSECURE = False
 PROBE_CA_FILE: str | None = None
+SCORE_ALPHA = DEFAULT_SCORE_ALPHA
+STICKY_IMPROVEMENT_THRESHOLD = DEFAULT_STICKY_IMPROVEMENT_THRESHOLD
+LATENCY_WINDOW_SIZE = DEFAULT_LATENCY_WINDOW
+FAILURE_THRESHOLD = DEFAULT_FAILURE_THRESHOLD
+
+ENV_WRITE_TARGET: Path | None = None
+PROXY_PUBLIC_BASE_URL: str | None = None
+LAST_WRITTEN_ENV: dict[str, str] | None = None
+ENV_WRITE_LOCK = threading.Lock()
 
 app = FastAPI(title="AI Auto Switch Proxy")
 
 
 def print_rumps_install_hint() -> None:
-    print(f"[menubar] to enable menubar mode, run: {RUMPS_INSTALL_CMD}", flush=True)
+    _log(f"[menubar] to enable menubar mode, run: {RUMPS_INSTALL_CMD}")
+
+
+def _log(message: str) -> None:
+    ts = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S%z")
+    print(f"[{ts}] {message}", flush=True)
 
 
 def _compact_error(error: str | None, limit: int = 160) -> str | None:
@@ -85,84 +96,113 @@ def _compact_error(error: str | None, limit: int = 160) -> str | None:
     return one_line[: limit - 3] + "..."
 
 
-def _format_median(median_latency_ms: float | None) -> str:
-    if median_latency_ms is None:
+def _format_ms(value: float | None) -> str:
+    if value is None:
         return "-"
-    return f"{median_latency_ms:.1f}ms"
+    return f"{value:.1f}ms"
 
 
-def _format_latency_list(latencies_ms: list[float]) -> str:
-    if not latencies_ms:
-        return "-"
-    return ", ".join(f"{latency:.1f}ms" for latency in latencies_ms)
+def build_public_proxy_base_url(host: str, port: int) -> str:
+    resolved_host = host.strip()
+    if resolved_host in {"0.0.0.0", "::", "[::]"}:
+        # Bind-only hosts are not useful as client-facing URLs.
+        resolved_host = "127.0.0.1"
+    if ":" in resolved_host and not resolved_host.startswith("["):
+        resolved_host = f"[{resolved_host}]"
+    return f"http://{resolved_host}:{port}"
 
 
-def _provider_status_word(item: switch.ProbeSummary) -> str:
-    return "WORKING" if item.is_healthy else "NOT_WORKING"
-
-
-def log_probe_stage_summary(stage: str, ranked: list[switch.ProbeSummary]) -> None:
-    if not ranked:
-        print(f"[probe-stage][{stage}] NOT_WORKING providers=0", flush=True)
+def maybe_write_proxy_env(provider: switch.Provider) -> None:
+    global LAST_WRITTEN_ENV
+    if not ENV_WRITE_TARGET or not PROXY_PUBLIC_BASE_URL:
         return
 
-    healthy_count = sum(1 for item in ranked if item.is_healthy)
-    fastest = next((item for item in ranked if item.is_healthy), None)
-    if fastest:
-        fastest_info = (
-            f"{fastest.provider.name} ({_format_median(fastest.median_latency_ms)})"
-        )
-        status = "WORKING"
-    else:
-        fastest_info = "none"
-        status = "NOT_WORKING"
+    selected_env = {
+        "GOOGLE_GEMINI_BASE_URL": PROXY_PUBLIC_BASE_URL,
+        "GEMINI_API_KEY": provider.api_key,
+        "GOOGLE_GEMINI_API_KEY": provider.api_key,
+        "GEMINI_MODEL": provider.session_model,
+        "GOOGLE_GEMINI_MODEL": provider.session_model,
+    }
 
-    print(
-        f"[probe-stage][{stage}] {status} "
-        f"healthy={healthy_count}/{len(ranked)} fastest={fastest_info}",
-        flush=True,
+    with ENV_WRITE_LOCK:
+        if LAST_WRITTEN_ENV == selected_env:
+            return
+        switch.write_env_file(ENV_WRITE_TARGET, selected_env)
+        LAST_WRITTEN_ENV = dict(selected_env)
+
+    _log(
+        f"[env] updated file={ENV_WRITE_TARGET} "
+        f"base_url={PROXY_PUBLIC_BASE_URL} "
+        f"provider={provider.name} key={switch.mask_key(provider.api_key)}"
     )
 
-    for index, item in enumerate(ranked, start=1):
-        status_word = _provider_status_word(item)
-        latency = _format_median(item.median_attempt_latency_ms)
-        line = (
-            f"[probe-stage][{stage}] {index:02d} "
-            f"{item.provider.name}={status_word} latency={latency}"
-        )
-        if not item.is_healthy:
-            reason = _compact_error(item.last_error)
-            if reason:
-                line += f" reason={reason}"
-        print(line, flush=True)
+
+def _load_raw_provider_items(config_path: Path) -> list[dict[str, Any]]:
+    try:
+        raw = json.loads(config_path.read_text(encoding="utf-8"))
+    except FileNotFoundError as err:
+        raise ValueError(f"Config file not found: {config_path}") from err
+    except json.JSONDecodeError as err:
+        raise ValueError(f"Invalid JSON in config: {config_path} ({err})") from err
+
+    if isinstance(raw, dict):
+        items = raw.get("providers")
+    elif isinstance(raw, list):
+        items = raw
+    else:
+        raise ValueError("Config must be either a list or an object with a providers list.")
+
+    if not isinstance(items, list) or not items:
+        raise ValueError("Providers list is empty.")
+
+    normalized: list[dict[str, Any]] = []
+    for index, item in enumerate(items, start=1):
+        if not isinstance(item, dict):
+            raise ValueError(f"Provider entry #{index} must be a JSON object.")
+        normalized.append(item)
+    return normalized
 
 
-def log_probe_details(stage: str, ranked: list[switch.ProbeSummary]) -> None:
-    if not PROBE_DETAIL:
-        return
-    if not ranked:
-        return
+def load_runtime_providers(config_path: str) -> list[ProviderRuntime]:
+    path = Path(config_path).expanduser()
+    raw_items = _load_raw_provider_items(path)
+    parsed_providers = switch.load_providers(
+        path,
+        None,
+        switch.DEFAULT_TEST_MODEL,
+        switch.DEFAULT_SESSION_MODEL,
+    )
+    if len(parsed_providers) != len(raw_items):
+        raise ValueError("Internal provider parse mismatch.")
 
-    name_width = max(len(item.provider.name) for item in ranked)
-    for index, item in enumerate(ranked, start=1):
-        health = "OK" if item.is_healthy else "FAIL"
-        median_success = _format_median(item.median_latency_ms)
-        median_attempt = _format_median(item.median_attempt_latency_ms)
-        latencies = _format_latency_list(item.attempt_latencies_ms)
-        print(
-            f"[probe-detail][{stage}] {index:02d} "
-            f"{item.provider.name:<{name_width}} "
-            f"status={health:<4} success={item.success_count}/{item.attempts} "
-            f"median_ok={median_success:<9} median_try={median_attempt:<9} "
-            f"attempt_latencies=[{latencies}]",
-            flush=True,
-        )
-        compact_error = _compact_error(item.last_error)
-        if compact_error:
-            print(
-                f"[probe-detail][{stage}]    error[{item.provider.name}]: {compact_error}",
-                flush=True,
+    runtimes: list[ProviderRuntime] = []
+    seen_names: set[str] = set()
+    for index, (provider, raw_item) in enumerate(zip(parsed_providers, raw_items), start=1):
+        if provider.name in seen_names:
+            raise ValueError(f'Duplicate provider name "{provider.name}" is not supported.')
+        seen_names.add(provider.name)
+
+        if "input_price" not in raw_item:
+            raise ValueError(
+                f'Provider "{provider.name}" missing required field: input_price '
+                f"(entry #{index})."
             )
+        try:
+            input_price = float(raw_item["input_price"])
+        except (TypeError, ValueError) as err:
+            raise ValueError(
+                f'Provider "{provider.name}" has invalid input_price: '
+                f"{raw_item['input_price']!r}"
+            ) from err
+        if input_price < 0:
+            raise ValueError(
+                f'Provider "{provider.name}" must use input_price >= 0.'
+            )
+
+        runtimes.append(ProviderRuntime(provider=provider, input_price=input_price))
+
+    return runtimes
 
 
 def parse_args() -> argparse.Namespace:
@@ -193,7 +233,7 @@ def parse_args() -> argparse.Namespace:
         "--probe-attempts",
         type=int,
         default=DEFAULT_PROBE_ATTEMPTS,
-        help=f"Attempts per provider in background probe (default: {DEFAULT_PROBE_ATTEMPTS}).",
+        help=f"Attempts per provider for each probe cycle (default: {DEFAULT_PROBE_ATTEMPTS}).",
     )
     parser.add_argument(
         "--probe-timeout",
@@ -206,32 +246,51 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=DEFAULT_PROBE_TOTAL_TIMEOUT_SECONDS,
         help=(
-            "Total timeout in seconds for each background probe run "
+            "Total timeout in seconds for each background probe cycle "
             f"(default: {DEFAULT_PROBE_TOTAL_TIMEOUT_SECONDS})."
         ),
     )
     parser.add_argument(
-        "--probe-expensive-attempts",
-        type=int,
-        default=DEFAULT_PROBE_EXPENSIVE_ATTEMPTS,
+        "--alpha",
+        type=float,
+        default=DEFAULT_SCORE_ALPHA,
         help=(
-            "Attempts per provider for expensive fallback probe "
-            f"(default: {DEFAULT_PROBE_EXPENSIVE_ATTEMPTS})."
+            "Score weight for normalized price (0.0..1.0). "
+            f"Latency weight is (1-alpha). Default: {DEFAULT_SCORE_ALPHA}."
         ),
     )
     parser.add_argument(
-        "--probe-expensive-threshold-ms",
+        "--sticky-improvement-threshold",
         type=float,
-        default=DEFAULT_PROBE_EXPENSIVE_THRESHOLD_MS,
+        default=DEFAULT_STICKY_IMPROVEMENT_THRESHOLD,
         help=(
-            "Run expensive probe only when cheap probes are all failed "
-            f"or slower than this ms threshold (default: {DEFAULT_PROBE_EXPENSIVE_THRESHOLD_MS})."
+            "Switch active provider only when challenger score is at least this "
+            "fraction lower than active score (default: "
+            f"{DEFAULT_STICKY_IMPROVEMENT_THRESHOLD})."
+        ),
+    )
+    parser.add_argument(
+        "--latency-window",
+        type=int,
+        default=DEFAULT_LATENCY_WINDOW,
+        help=(
+            "Moving-average window size for successful probe latencies "
+            f"(default: {DEFAULT_LATENCY_WINDOW})."
+        ),
+    )
+    parser.add_argument(
+        "--failure-threshold",
+        type=int,
+        default=DEFAULT_FAILURE_THRESHOLD,
+        help=(
+            "Mark provider unhealthy after this many consecutive failed probe cycles "
+            f"(default: {DEFAULT_FAILURE_THRESHOLD})."
         ),
     )
     parser.add_argument(
         "--probe-detail",
         action="store_true",
-        help="Print per-provider probe details (default: summary only).",
+        help="Print per-provider probe details.",
     )
     parser.add_argument(
         "--insecure",
@@ -272,6 +331,22 @@ def parse_args() -> argparse.Namespace:
             f"(default: {DEFAULT_BACKGROUND_LOG_FILE})."
         ),
     )
+    parser.add_argument(
+        "--write-env",
+        default=None,
+        help=(
+            "Write selected proxy env vars into this file "
+            "(e.g. ~/.gemini/.env)."
+        ),
+    )
+    parser.add_argument(
+        "--no-auto-write",
+        action="store_true",
+        help=(
+            f"Do not auto-write selected proxy env vars to {DEFAULT_PROXY_ENV_FILE} "
+            "when --write-env is absent."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -297,10 +372,14 @@ def launch_background_process(args: argparse.Namespace) -> int:
         str(args.probe_timeout),
         "--probe-total-timeout",
         str(args.probe_total_timeout),
-        "--probe-expensive-attempts",
-        str(args.probe_expensive_attempts),
-        "--probe-expensive-threshold-ms",
-        str(args.probe_expensive_threshold_ms),
+        "--alpha",
+        str(args.alpha),
+        "--sticky-improvement-threshold",
+        str(args.sticky_improvement_threshold),
+        "--latency-window",
+        str(args.latency_window),
+        "--failure-threshold",
+        str(args.failure_threshold),
     ]
     if args.probe_detail:
         cmd.append("--probe-detail")
@@ -312,6 +391,10 @@ def launch_background_process(args: argparse.Namespace) -> int:
         cmd.append("--headless")
     elif args.menubar:
         cmd.append("--menubar")
+    if args.write_env:
+        cmd.extend(["--write-env", args.write_env])
+    if args.no_auto_write:
+        cmd.append("--no-auto-write")
 
     with log_path.open("ab") as log_fp:
         process = subprocess.Popen(
@@ -322,124 +405,311 @@ def launch_background_process(args: argparse.Namespace) -> int:
             start_new_session=True,
         )
 
-    print(f"[proxy] started in background: pid={process.pid}")
-    print(f"[proxy] log file: {log_path}")
-    print(f"[proxy] health: curl -sS http://{args.host}:{args.port}/_health")
+    _log(f"[proxy] started in background: pid={process.pid}")
+    _log(f"[proxy] log file: {log_path}")
+    _log(f"[proxy] health: curl -sS http://{args.host}:{args.port}/_health")
     return 0
 
 
-def load_runtime_providers(config_path: str) -> list[switch.Provider]:
-    return switch.load_providers(
-        Path(config_path).expanduser(),
-        None,
-        switch.DEFAULT_TEST_MODEL,
-        switch.DEFAULT_SESSION_MODEL,
-    )
+def _normalize(value: float, min_value: float, max_value: float) -> float:
+    if max_value <= min_value:
+        return 0.0
+    return (value - min_value) / (max_value - min_value)
 
 
-def run_probe_once() -> switch.ProbeSummary | None:
-    if not PROVIDERS:
-        APP_STATE.set_probe_result(None, "No providers configured.")
+def _error_is_timeout(error: str | None) -> bool:
+    if not error:
+        return False
+    lower = error.lower()
+    return "timeout" in lower or "timed out" in lower
+
+
+def _error_http_status(error: str | None) -> int | None:
+    if not error:
+        return None
+    match = HTTP_STATUS_PATTERN.search(error)
+    if not match:
+        return None
+    try:
+        return int(match.group(1))
+    except ValueError:
         return None
 
-    cheap_providers = [item for item in PROVIDERS if not item.expensive_only]
-    expensive_providers = [item for item in PROVIDERS if not item.cheap_only]
-    if not cheap_providers and not expensive_providers:
-        APP_STATE.set_probe_result(None, "No providers enabled for probing.")
-        return None
 
-    deadline = time.monotonic() + PROBE_TOTAL_TIMEOUT_SECONDS
-    cheap_summaries = switch.probe_all_providers_parallel(
-        providers=cheap_providers,
-        attempts=PROBE_ATTEMPTS,
-        timeout_s=PROBE_TIMEOUT_SECONDS,
-        insecure=PROBE_INSECURE,
-        ca_file=PROBE_CA_FILE,
-        deadline=deadline,
+def _error_is_http_5xx(error: str | None) -> bool:
+    status = _error_http_status(error)
+    return bool(status is not None and 500 <= status < 600)
+
+
+def _is_significantly_better(candidate_score: float, active_score: float) -> bool:
+    if candidate_score >= active_score:
+        return False
+    if active_score <= 0:
+        return candidate_score < active_score
+    improvement = (active_score - candidate_score) / active_score
+    return improvement >= STICKY_IMPROVEMENT_THRESHOLD
+
+
+def _healthy_runtimes_locked() -> list[ProviderRuntime]:
+    out: list[ProviderRuntime] = []
+    for name in RUNTIME_ORDER:
+        item = RUNTIME_BY_NAME[name]
+        if item.is_healthy and item.moving_avg_latency_ms is not None:
+            out.append(item)
+    return out
+
+
+def _recompute_scores_locked() -> list[ProviderRuntime]:
+    for name in RUNTIME_ORDER:
+        RUNTIME_BY_NAME[name].balance_score = None
+
+    healthy = _healthy_runtimes_locked()
+    if not healthy:
+        return []
+
+    prices = [item.input_price for item in healthy]
+    latencies = [item.moving_avg_latency_ms for item in healthy if item.moving_avg_latency_ms is not None]
+    if not latencies:
+        return []
+
+    min_price = min(prices)
+    max_price = max(prices)
+    min_latency = min(latencies)
+    max_latency = max(latencies)
+
+    for item in healthy:
+        assert item.moving_avg_latency_ms is not None
+        normalized_price = _normalize(item.input_price, min_price, max_price)
+        normalized_latency = _normalize(item.moving_avg_latency_ms, min_latency, max_latency)
+        item.balance_score = (SCORE_ALPHA * normalized_price) + ((1.0 - SCORE_ALPHA) * normalized_latency)
+
+    return healthy
+
+
+def _elect_active_provider_locked() -> tuple[ProviderRuntime | None, bool, str]:
+    global ACTIVE_PROVIDER_NAME
+
+    healthy = _recompute_scores_locked()
+    previous_name = ACTIVE_PROVIDER_NAME
+    previous = RUNTIME_BY_NAME.get(previous_name) if previous_name else None
+
+    if not healthy:
+        ACTIVE_PROVIDER_NAME = None
+        changed = previous_name is not None
+        return None, changed, "none_healthy"
+
+    ranked = sorted(
+        healthy,
+        key=lambda item: (
+            item.balance_score if item.balance_score is not None else float("inf"),
+            item.moving_avg_latency_ms if item.moving_avg_latency_ms is not None else float("inf"),
+            item.input_price,
+            item.provider.name,
+        ),
     )
-    cheap_ranked = switch.rank_summaries(cheap_summaries)
-    log_probe_stage_summary("cheap", cheap_ranked)
-    log_probe_details("cheap", cheap_ranked)
-    cheap_selected = next((item for item in cheap_ranked if item.is_healthy), None)
+    best = ranked[0]
 
-    selected = cheap_selected
-    selected_source = "cheap" if cheap_selected else None
-    expensive_ranked: list[switch.ProbeSummary] | None = None
+    if previous and previous.is_healthy and previous.balance_score is not None:
+        if (
+            best.provider.name != previous.provider.name
+            and best.balance_score is not None
+            and _is_significantly_better(best.balance_score, previous.balance_score)
+        ):
+            ACTIVE_PROVIDER_NAME = best.provider.name
+            return best, True, "switch_better_score"
+        ACTIVE_PROVIDER_NAME = previous.provider.name
+        return previous, False, "sticky_keep"
 
-    should_run_expensive = (
-        bool(expensive_providers)
-        and switch.should_run_expensive_probe(
-            cheap_ranked, PROBE_EXPENSIVE_THRESHOLD_MS
-        )
-    )
-    if should_run_expensive:
-        print(
-            "[probe-stage][expensive] TRIGGERED "
-            f"reason=cheap_failed_or_slow threshold={PROBE_EXPENSIVE_THRESHOLD_MS:.1f}ms",
-            flush=True,
-        )
-        expensive_summaries = switch.probe_all_providers_parallel(
-            providers=switch.build_expensive_providers(expensive_providers),
-            attempts=PROBE_EXPENSIVE_ATTEMPTS,
+    ACTIVE_PROVIDER_NAME = best.provider.name
+    changed = previous_name != ACTIVE_PROVIDER_NAME
+    return best, changed, "select_best"
+
+
+def _initialize_runtime(providers: list[ProviderRuntime]) -> None:
+    global RUNTIME_BY_NAME
+    global RUNTIME_ORDER
+    global ACTIVE_PROVIDER_NAME
+    global LAST_PROBE_ERROR
+    global LAST_PROBE_TIME_UNIX
+
+    with RUNTIME_LOCK:
+        RUNTIME_BY_NAME = {item.provider.name: item for item in providers}
+        RUNTIME_ORDER = [item.provider.name for item in providers]
+        ACTIVE_PROVIDER_NAME = None
+        LAST_PROBE_ERROR = None
+        LAST_PROBE_TIME_UNIX = None
+
+
+def _log_probe_cycle(result_by_name: dict[str, tuple[bool, float | None, str | None]], selection_reason: str) -> None:
+    with RUNTIME_LOCK:
+        total = len(RUNTIME_ORDER)
+        healthy = [item for item in _healthy_runtimes_locked()]
+        active = RUNTIME_BY_NAME.get(ACTIVE_PROVIDER_NAME) if ACTIVE_PROVIDER_NAME else None
+
+        if active and active.balance_score is not None:
+            _log(
+                "[probe-status] WORKING "
+                f"healthy={len(healthy)}/{total} "
+                f"selected={active.provider.name} "
+                f"score={active.balance_score:.4f} "
+                f"latency={_format_ms(active.moving_avg_latency_ms)} "
+                f"reason={selection_reason}"
+            )
+        elif healthy:
+            _log(
+                "[probe-status] WORKING "
+                f"healthy={len(healthy)}/{total} "
+                "selected=none "
+                f"reason={selection_reason}"
+            )
+        else:
+            _log(
+                "[probe-status] NOT_WORKING "
+                f"healthy=0/{total} reason={_compact_error(LAST_PROBE_ERROR) or 'No healthy provider.'}"
+            )
+
+        for name in RUNTIME_ORDER:
+            item = RUNTIME_BY_NAME[name]
+            probe_ok, probe_latency, probe_error = result_by_name.get(name, (False, None, "No probe result"))
+            state_word = "WORKING" if item.is_healthy else "NOT_WORKING"
+            score = "-" if item.balance_score is None else f"{item.balance_score:.4f}"
+            line = (
+                f"[probe-provider] {item.provider.name}={state_word} "
+                f"avg_latency={_format_ms(item.moving_avg_latency_ms)} "
+                f"score={score} "
+                f"fails={item.consecutive_failures}"
+            )
+            if PROBE_DETAIL:
+                line += (
+                    f" probe_ok={probe_ok} "
+                    f"probe_latency={_format_ms(probe_latency)} "
+                    f"input_price={item.input_price:.6g} "
+                    f"cheap_only={item.provider.cheap_only} "
+                    f"expensive_only={item.provider.expensive_only}"
+                )
+                compact_probe_error = _compact_error(probe_error)
+                if compact_probe_error and not probe_ok:
+                    line += f" error={compact_probe_error}"
+            _log(line)
+
+
+def _probe_provider_cycle(provider: switch.Provider) -> tuple[bool, float | None, str | None]:
+    last_latency: float | None = None
+    last_error: str | None = None
+    for _ in range(PROBE_ATTEMPTS):
+        ok, latency_ms, error = switch.probe_once(
+            provider,
             timeout_s=PROBE_TIMEOUT_SECONDS,
             insecure=PROBE_INSECURE,
             ca_file=PROBE_CA_FILE,
-            deadline=deadline,
         )
-        expensive_ranked = switch.rank_summaries(expensive_summaries)
-        log_probe_stage_summary("expensive", expensive_ranked)
-        log_probe_details("expensive", expensive_ranked)
-        expensive_selected = next(
-            (item for item in expensive_ranked if item.is_healthy), None
-        )
-        if expensive_selected:
-            selected = expensive_selected
-            selected_source = "expensive"
-        elif selected:
-            selected_source = "cheap_fallback"
-            print(
-                "[probe-stage][expensive] FALLBACK "
-                "reason=no_healthy_expensive using=cheap_winner",
-                flush=True,
-            )
-    elif cheap_ranked:
-        print(
-            "[probe-stage][expensive] SKIPPED "
-            f"reason=cheap_healthy_within_threshold threshold={PROBE_EXPENSIVE_THRESHOLD_MS:.1f}ms",
-            flush=True,
-        )
-    else:
-        print("[probe-stage][expensive] SKIPPED reason=no_providers", flush=True)
+        last_latency = latency_ms
+        last_error = error
+        if ok:
+            return True, latency_ms, None
+    return False, last_latency, last_error or "Probe failed"
 
-    if selected:
-        selected_latency = _format_median(selected.median_latency_ms)
-        print(
-            f"[probe-status] WORKING selected={selected.provider.name} "
-            f"source={selected_source} latency={selected_latency}",
-            flush=True,
-        )
-        APP_STATE.set_probe_result(
-            selected.provider, None, latency_ms=selected.median_latency_ms
-        )
-    else:
-        ranked_error_sources = []
-        if expensive_ranked is not None:
-            ranked_error_sources.append(expensive_ranked)
-        ranked_error_sources.append(cheap_ranked)
-        errors = [
-            item.last_error
-            for ranked in ranked_error_sources
-            for item in ranked
-            if item.last_error
-        ]
-        APP_STATE.set_probe_result(
-            None, errors[0] if errors else "No healthy provider.", latency_ms=None
-        )
-        print(
-            f"[probe-status] NOT_WORKING reason={_compact_error(errors[0] if errors else 'No healthy provider.')}",
-            flush=True,
-        )
-    return selected
+
+def run_probe_once() -> switch.Provider | None:
+    global ACTIVE_PROVIDER_NAME
+    global LAST_PROBE_ERROR
+    global LAST_PROBE_TIME_UNIX
+
+    with RUNTIME_LOCK:
+        names = list(RUNTIME_ORDER)
+        providers = [RUNTIME_BY_NAME[name].provider for name in names]
+
+    if not providers:
+        with RUNTIME_LOCK:
+            LAST_PROBE_TIME_UNIX = time.time()
+            LAST_PROBE_ERROR = "No providers configured."
+            ACTIVE_PROVIDER_NAME = None
+        return None
+
+    deadline = time.monotonic() + PROBE_TOTAL_TIMEOUT_SECONDS
+    result_by_name: dict[str, tuple[bool, float | None, str | None]] = {}
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, len(providers))) as executor:
+        futures: dict[concurrent.futures.Future[tuple[bool, float | None, str | None]], str] = {}
+        for name, provider in zip(names, providers):
+            futures[executor.submit(_probe_provider_cycle, provider)] = name
+
+        remaining = max(0.0, deadline - time.monotonic())
+        done, not_done = concurrent.futures.wait(futures.keys(), timeout=remaining)
+
+        for future in done:
+            name = futures[future]
+            try:
+                result_by_name[name] = future.result()
+            except Exception as err:
+                result_by_name[name] = (False, None, f"Probe exception: {type(err).__name__}: {err}")
+
+        for future in not_done:
+            name = futures[future]
+            future.cancel()
+            result_by_name[name] = (False, None, "Probe total timeout exceeded")
+
+    env_update_provider: switch.Provider | None = None
+    selection_reason = "none"
+    selected_provider: switch.Provider | None = None
+    now_unix = time.time()
+
+    with RUNTIME_LOCK:
+        LAST_PROBE_TIME_UNIX = now_unix
+
+        for name in names:
+            runtime = RUNTIME_BY_NAME[name]
+            ok, latency_ms, error = result_by_name.get(name, (False, None, "No probe result"))
+
+            runtime.last_probe_time_unix = now_unix
+            runtime.last_probe_latency_ms = latency_ms
+
+            if ok:
+                runtime.is_healthy = True
+                runtime.consecutive_failures = 0
+                runtime.last_error = None
+                if latency_ms is not None:
+                    runtime.success_latencies_ms.append(latency_ms)
+                    if len(runtime.success_latencies_ms) > LATENCY_WINDOW_SIZE:
+                        runtime.success_latencies_ms = runtime.success_latencies_ms[-LATENCY_WINDOW_SIZE:]
+                if runtime.success_latencies_ms:
+                    runtime.moving_avg_latency_ms = (
+                        sum(runtime.success_latencies_ms) / len(runtime.success_latencies_ms)
+                    )
+                else:
+                    runtime.moving_avg_latency_ms = None
+                continue
+
+            runtime.consecutive_failures += 1
+            runtime.last_error = error or "Probe failed"
+
+            immediate_unhealthy = _error_is_timeout(runtime.last_error) or _error_is_http_5xx(
+                runtime.last_error
+            )
+            if immediate_unhealthy or runtime.consecutive_failures >= FAILURE_THRESHOLD:
+                runtime.is_healthy = False
+                runtime.balance_score = None
+
+        selected_runtime, changed, selection_reason = _elect_active_provider_locked()
+
+        if selected_runtime:
+            selected_provider = selected_runtime.provider
+            LAST_PROBE_ERROR = None
+            if changed:
+                env_update_provider = selected_runtime.provider
+        else:
+            errors = [
+                item.last_error
+                for item in (RUNTIME_BY_NAME[name] for name in RUNTIME_ORDER)
+                if item.last_error
+            ]
+            LAST_PROBE_ERROR = errors[0] if errors else "No healthy provider."
+
+    _log_probe_cycle(result_by_name, selection_reason)
+
+    if env_update_provider:
+        maybe_write_proxy_env(env_update_provider)
+    return selected_provider
 
 
 def prober_loop() -> None:
@@ -447,8 +717,10 @@ def prober_loop() -> None:
         try:
             run_probe_once()
         except Exception as err:  # pragma: no cover
-            APP_STATE.set_probe_result(None, f"Probe exception: {type(err).__name__}: {err}")
-            print(f"[probe] exception: {err}", flush=True)
+            global LAST_PROBE_ERROR
+            with RUNTIME_LOCK:
+                LAST_PROBE_ERROR = f"Probe exception: {type(err).__name__}: {err}"
+            _log(f"[probe] exception: {err}")
         time.sleep(PROBE_INTERVAL_SECONDS)
 
 
@@ -470,38 +742,123 @@ async def _proxy_stream_generator(
         await client.aclose()
 
 
-@app.get("/_health")
-async def health() -> JSONResponse:
-    provider, err, ts, latency_ms = APP_STATE.snapshot()
-    payload = {
-        "best_provider": provider.name if provider else None,
-        "base_url": provider.base_url if provider else None,
-        "last_probe_error": err,
-        "last_probe_time_unix": ts,
-        "last_probe_latency_ms": latency_ms,
-    }
-    return JSONResponse(payload)
+def _build_health_payload() -> dict[str, Any]:
+    with RUNTIME_LOCK:
+        active = RUNTIME_BY_NAME.get(ACTIVE_PROVIDER_NAME) if ACTIVE_PROVIDER_NAME else None
+        providers_payload = []
+        for name in RUNTIME_ORDER:
+            item = RUNTIME_BY_NAME[name]
+            providers_payload.append(
+                {
+                    "name": item.provider.name,
+                    "base_url": item.provider.base_url,
+                    "input_price": item.input_price,
+                    "is_healthy": item.is_healthy,
+                    "consecutive_failures": item.consecutive_failures,
+                    "last_error": item.last_error,
+                    "last_probe_latency_ms": item.last_probe_latency_ms,
+                    "moving_avg_latency_ms": item.moving_avg_latency_ms,
+                    "balance_score": item.balance_score,
+                    "cheap_only": item.provider.cheap_only,
+                    "expensive_only": item.provider.expensive_only,
+                }
+            )
+
+        payload = {
+            # Keep legacy keys for compatibility.
+            "best_provider": active.provider.name if active else None,
+            "base_url": active.provider.base_url if active else None,
+            "last_probe_error": LAST_PROBE_ERROR,
+            "last_probe_time_unix": LAST_PROBE_TIME_UNIX,
+            "last_probe_latency_ms": active.moving_avg_latency_ms if active else None,
+            # New routing metadata.
+            "active_provider": active.provider.name if active else None,
+            "score_alpha": SCORE_ALPHA,
+            "sticky_improvement_threshold": STICKY_IMPROVEMENT_THRESHOLD,
+            "latency_window": LATENCY_WINDOW_SIZE,
+            "failure_threshold": FAILURE_THRESHOLD,
+            "providers": providers_payload,
+        }
+    return payload
 
 
-@app.api_route(
-    "/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"]
-)
-async def proxy_handler(request: Request, path: str):
-    provider, err, _, _ = APP_STATE.snapshot()
-    if not provider:
-        return JSONResponse(
-            {
-                "error": "No healthy provider selected yet. Please wait a moment.",
-                "detail": err,
-            },
-            status_code=503,
-        )
+def _select_provider_for_request() -> tuple[switch.Provider | None, str | None, switch.Provider | None]:
+    env_update_provider: switch.Provider | None = None
+    with RUNTIME_LOCK:
+        active = RUNTIME_BY_NAME.get(ACTIVE_PROVIDER_NAME) if ACTIVE_PROVIDER_NAME else None
+        if active and active.is_healthy:
+            return active.provider, None, None
 
+        selected_runtime, changed, selection_reason = _elect_active_provider_locked()
+        if selected_runtime:
+            if changed:
+                env_update_provider = selected_runtime.provider
+                _log(f"[route] selected={selected_runtime.provider.name} reason={selection_reason}")
+            return selected_runtime.provider, None, env_update_provider
+
+        error = LAST_PROBE_ERROR or "No healthy provider selected yet."
+        return None, error, None
+
+
+def _mark_provider_unhealthy_from_live_failure(
+    provider_name: str, error: str
+) -> tuple[switch.Provider | None, switch.Provider | None]:
+    global LAST_PROBE_ERROR
+    env_update_provider: switch.Provider | None = None
+
+    with RUNTIME_LOCK:
+        runtime = RUNTIME_BY_NAME.get(provider_name)
+        if runtime:
+            runtime.is_healthy = False
+            runtime.consecutive_failures = max(runtime.consecutive_failures + 1, FAILURE_THRESHOLD)
+            runtime.last_error = error
+            runtime.balance_score = None
+            runtime.last_probe_time_unix = time.time()
+
+        LAST_PROBE_ERROR = error
+        selected_runtime, changed, selection_reason = _elect_active_provider_locked()
+        if selected_runtime and changed:
+            env_update_provider = selected_runtime.provider
+            _log(
+                f"[route] failover from={provider_name} to={selected_runtime.provider.name} "
+                f"reason={selection_reason}"
+            )
+        elif selected_runtime is None:
+            _log(f"[route] no healthy providers after failure from={provider_name}")
+
+        selected_provider = selected_runtime.provider if selected_runtime else None
+
+    return selected_provider, env_update_provider
+
+
+def _is_retryable_live_status(status_code: int) -> bool:
+    return status_code in RETRYABLE_LIVE_STATUS_CODES or status_code >= 500
+
+
+async def _read_error_excerpt(response: httpx.Response, limit: int = 200) -> str:
+    try:
+        content = await response.aread()
+    except Exception:
+        return ""
+    text = content.decode("utf-8", errors="ignore").strip()
+    one_line = " ".join(text.split())
+    if len(one_line) <= limit:
+        return one_line
+    return one_line[: limit - 3] + "..."
+
+
+async def _send_request_to_provider(
+    request: Request,
+    path: str,
+    body: bytes,
+    provider: switch.Provider,
+) -> tuple[httpx.AsyncClient | None, httpx.Response | None, str | None]:
     base = provider.base_url.rstrip("/")
     target_url = f"{base}/{path.lstrip('/')}"
-    params = dict(request.query_params)
+
+    params = list(request.query_params.multi_items())
     if provider.use_query_key:
-        params["key"] = provider.api_key
+        params.append(("key", provider.api_key))
 
     headers = dict(request.headers)
     headers.pop("host", None)
@@ -509,23 +866,112 @@ async def proxy_handler(request: Request, path: str):
     headers["accept-encoding"] = "identity"
     if provider.use_header_key:
         headers[provider.header_key_name] = provider.api_key
+    if provider.headers:
+        headers.update(provider.headers)
 
-    body = await request.body()
     client = httpx.AsyncClient(timeout=120.0)
-    req = client.build_request(
-        method=request.method,
-        url=target_url,
-        params=params,
-        headers=headers,
-        content=body,
-    )
+    try:
+        req = client.build_request(
+            method=request.method,
+            url=target_url,
+            params=params,
+            headers=headers,
+            content=body,
+        )
+        response = await client.send(req, stream=True)
+        return client, response, None
+    except Exception as err:
+        await client.aclose()
+        return None, None, f"{type(err).__name__}: {err}"
 
-    response = await client.send(req, stream=True)
-    proxy_headers = _sanitize_response_headers(response.headers)
-    return StreamingResponse(
-        _proxy_stream_generator(client, response),
-        status_code=response.status_code,
-        headers=proxy_headers,
+
+@app.get("/_health")
+async def health() -> JSONResponse:
+    return JSONResponse(_build_health_payload())
+
+
+@app.api_route(
+    "/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"]
+)
+async def proxy_handler(request: Request, path: str):
+    body = await request.body()
+
+    with RUNTIME_LOCK:
+        max_attempts = max(1, len(RUNTIME_ORDER))
+
+    attempts = 0
+    last_error: str | None = None
+
+    while attempts < max_attempts:
+        provider, err, env_update_provider = _select_provider_for_request()
+        if env_update_provider:
+            maybe_write_proxy_env(env_update_provider)
+
+        if not provider:
+            return JSONResponse(
+                {
+                    "error": "No healthy provider selected yet. Please wait a moment.",
+                    "detail": err,
+                },
+                status_code=503,
+            )
+
+        attempts += 1
+        client, response, send_error = await _send_request_to_provider(
+            request=request,
+            path=path,
+            body=body,
+            provider=provider,
+        )
+
+        if send_error:
+            last_error = send_error
+            _log(f"[live] provider={provider.name} failure={_compact_error(send_error)}")
+            next_provider, env_update_provider = _mark_provider_unhealthy_from_live_failure(
+                provider.name,
+                send_error,
+            )
+            if env_update_provider:
+                maybe_write_proxy_env(env_update_provider)
+            if not next_provider:
+                break
+            continue
+
+        assert client is not None
+        assert response is not None
+
+        if _is_retryable_live_status(response.status_code):
+            excerpt = await _read_error_excerpt(response)
+            failure = f"HTTP {response.status_code}"
+            if excerpt:
+                failure = f"{failure}: {excerpt}"
+            last_error = failure
+            _log(f"[live] provider={provider.name} failure={_compact_error(failure)}")
+            await response.aclose()
+            await client.aclose()
+            next_provider, env_update_provider = _mark_provider_unhealthy_from_live_failure(
+                provider.name,
+                failure,
+            )
+            if env_update_provider:
+                maybe_write_proxy_env(env_update_provider)
+            if not next_provider:
+                break
+            continue
+
+        proxy_headers = _sanitize_response_headers(response.headers)
+        return StreamingResponse(
+            _proxy_stream_generator(client, response),
+            status_code=response.status_code,
+            headers=proxy_headers,
+        )
+
+    return JSONResponse(
+        {
+            "error": "All providers failed during request.",
+            "detail": _compact_error(last_error) or "No healthy providers available.",
+        },
+        status_code=503,
     )
 
 
@@ -533,7 +979,7 @@ def run_optional_menubar() -> bool:
     try:
         import rumps
     except Exception as err:
-        print(f"[menubar] disabled: failed to import rumps ({err})", flush=True)
+        _log(f"[menubar] disabled: failed to import rumps ({err})")
         print_rumps_install_hint()
         return False
 
@@ -550,13 +996,16 @@ def run_optional_menubar() -> bool:
             self._timer.start()
 
         def _refresh_title(self, _=None):
-            provider, err, _, latency_ms = APP_STATE.snapshot()
-            if provider:
-                if latency_ms is not None:
-                    self.title = f"🤖 {provider.name} ({int(latency_ms)}ms)"
+            with RUNTIME_LOCK:
+                active = RUNTIME_BY_NAME.get(ACTIVE_PROVIDER_NAME) if ACTIVE_PROVIDER_NAME else None
+                error = LAST_PROBE_ERROR
+
+            if active:
+                if active.moving_avg_latency_ms is not None:
+                    self.title = f"🤖 {active.provider.name} ({int(active.moving_avg_latency_ms)}ms)"
                 else:
-                    self.title = f"🤖 {provider.name}"
-            elif err:
+                    self.title = f"🤖 {active.provider.name}"
+            elif error:
                 self.title = "🤖 Error"
             else:
                 self.title = "🤖 Init"
@@ -569,7 +1018,7 @@ def run_optional_menubar() -> bool:
         ProxyMenuBarApp().run()
         return True
     except Exception as err:
-        print(f"[menubar] disabled: runtime error ({err})", flush=True)
+        _log(f"[menubar] disabled: runtime error ({err})")
         return False
 
 
@@ -578,63 +1027,100 @@ def run_uvicorn_server(host: str, port: int) -> None:
 
 
 def main() -> int:
-    global PROVIDERS
     global PROBE_INTERVAL_SECONDS
     global PROBE_ATTEMPTS
     global PROBE_TIMEOUT_SECONDS
     global PROBE_TOTAL_TIMEOUT_SECONDS
-    global PROBE_EXPENSIVE_ATTEMPTS
-    global PROBE_EXPENSIVE_THRESHOLD_MS
     global PROBE_DETAIL
     global PROBE_INSECURE
     global PROBE_CA_FILE
+    global SCORE_ALPHA
+    global STICKY_IMPROVEMENT_THRESHOLD
+    global LATENCY_WINDOW_SIZE
+    global FAILURE_THRESHOLD
+    global ENV_WRITE_TARGET
+    global PROXY_PUBLIC_BASE_URL
+    global LAST_WRITTEN_ENV
 
     args = parse_args()
     if args.headless and args.menubar:
-        print("Use only one of --headless or --menubar.")
+        _log("Use only one of --headless or --menubar.")
         return 2
     if not args.foreground:
         return launch_background_process(args)
 
     menubar_enabled = not args.headless
     if args.probe_interval <= 0:
-        print("--probe-interval must be > 0")
+        _log("--probe-interval must be > 0")
         return 2
     if args.probe_attempts <= 0:
-        print("--probe-attempts must be > 0")
+        _log("--probe-attempts must be > 0")
         return 2
     if args.probe_timeout <= 0:
-        print("--probe-timeout must be > 0")
+        _log("--probe-timeout must be > 0")
         return 2
     if args.probe_total_timeout <= 0:
-        print("--probe-total-timeout must be > 0")
+        _log("--probe-total-timeout must be > 0")
         return 2
-    if args.probe_expensive_attempts <= 0:
-        print("--probe-expensive-attempts must be > 0")
+    if not (0.0 <= args.alpha <= 1.0):
+        _log("--alpha must be between 0.0 and 1.0")
         return 2
-    if args.probe_expensive_threshold_ms < 0:
-        print("--probe-expensive-threshold-ms must be >= 0")
+    if not (0.0 <= args.sticky_improvement_threshold < 1.0):
+        _log("--sticky-improvement-threshold must be between 0.0 and <1.0")
+        return 2
+    if args.latency_window <= 0:
+        _log("--latency-window must be > 0")
+        return 2
+    if args.failure_threshold <= 0:
+        _log("--failure-threshold must be > 0")
         return 2
 
     try:
-        PROVIDERS = load_runtime_providers(args.config)
+        runtimes = load_runtime_providers(args.config)
     except Exception as err:
-        print(f"Failed to load providers: {err}")
+        _log(f"Failed to load providers: {err}")
         return 2
+    _initialize_runtime(runtimes)
 
     PROBE_INTERVAL_SECONDS = args.probe_interval
     PROBE_ATTEMPTS = args.probe_attempts
     PROBE_TIMEOUT_SECONDS = args.probe_timeout
     PROBE_TOTAL_TIMEOUT_SECONDS = args.probe_total_timeout
-    PROBE_EXPENSIVE_ATTEMPTS = args.probe_expensive_attempts
-    PROBE_EXPENSIVE_THRESHOLD_MS = args.probe_expensive_threshold_ms
     PROBE_DETAIL = bool(args.probe_detail)
     PROBE_INSECURE = args.insecure
+    SCORE_ALPHA = args.alpha
+    STICKY_IMPROVEMENT_THRESHOLD = args.sticky_improvement_threshold
+    LATENCY_WINDOW_SIZE = args.latency_window
+    FAILURE_THRESHOLD = args.failure_threshold
     try:
         PROBE_CA_FILE = None if PROBE_INSECURE else switch.resolve_ca_file(args.ca_file)
     except Exception as err:
-        print(f"Invalid TLS config: {err}")
+        _log(f"Invalid TLS config: {err}")
         return 2
+
+    env_write_target: str | None = args.write_env
+    auto_write = False
+    if not env_write_target and not args.no_auto_write:
+        env_write_target = DEFAULT_PROXY_ENV_FILE
+        auto_write = True
+    if env_write_target:
+        ENV_WRITE_TARGET = Path(env_write_target).expanduser()
+        PROXY_PUBLIC_BASE_URL = build_public_proxy_base_url(args.host, args.port)
+        LAST_WRITTEN_ENV = None
+        if auto_write:
+            _log(
+                f"[env] auto-write enabled file={ENV_WRITE_TARGET} "
+                f"base_url={PROXY_PUBLIC_BASE_URL}"
+            )
+        else:
+            _log(
+                f"[env] write target file={ENV_WRITE_TARGET} "
+                f"base_url={PROXY_PUBLIC_BASE_URL}"
+            )
+    else:
+        ENV_WRITE_TARGET = None
+        PROXY_PUBLIC_BASE_URL = None
+        LAST_WRITTEN_ENV = None
 
     run_probe_once()
     threading.Thread(target=prober_loop, daemon=True).start()
@@ -643,11 +1129,11 @@ def main() -> int:
         try:
             import rumps as _rumps  # noqa: F401
         except Exception as err:
-            print(f"[menubar] disabled: failed to import rumps ({err})", flush=True)
+            _log(f"[menubar] disabled: failed to import rumps ({err})")
             print_rumps_install_hint()
-            print("[menubar] falling back to headless server mode.", flush=True)
+            _log("[menubar] falling back to headless server mode.")
         else:
-            print("[menubar] enabled (default mode).", flush=True)
+            _log("[menubar] enabled (default mode).")
             # rumps must run on the main thread.
             threading.Thread(
                 target=run_uvicorn_server, args=(args.host, args.port), daemon=True
@@ -655,7 +1141,7 @@ def main() -> int:
             menubar_started = run_optional_menubar()
             if menubar_started:
                 return 0
-            print("[menubar] falling back to headless server mode.", flush=True)
+            _log("[menubar] falling back to headless server mode.")
 
     run_uvicorn_server(args.host, args.port)
     return 0

@@ -1,3 +1,5 @@
+// TODO: balance系数是可以调的，后面看下怎么调它会更合理一点
+
 # ai-auto-switch
 
 Probe multiple Gemini-compatible `{GOOGLE_GEMINI_BASE_URL, GEMINI_API_KEY}` pairs,
@@ -39,6 +41,7 @@ Then fill your providers in `providers.json`:
   "providers": [
     {
       "name": "yunwu-main",
+      "input_price": 1.2,
       "base_url": "https://yunwu.ai",
       "api_key_env": "YUNWU_MAIN_API_KEY",
       "model": "gemini-3-flash-preview",
@@ -46,6 +49,7 @@ Then fill your providers in `providers.json`:
     },
     {
       "name": "relay-backup",
+      "input_price": 3.8,
       "base_url": "https://another-relay.example",
       "api_key": "your-direct-key-here",
       "model": "gemini-3-flash-preview",
@@ -56,6 +60,7 @@ Then fill your providers in `providers.json`:
 ```
 
 Recommended: use `api_key_env` instead of plain `api_key`.
+For `proxy_app.py` score-based routing, each provider must include `input_price`.
 
 ## Usage
 
@@ -135,6 +140,21 @@ python3 proxy_app.py
 ```
 
 - Log file default: `/tmp/ai-auto-switch-proxy.log`
+- By default, proxy mode auto-updates `~/.gemini/.env` with:
+  - `GOOGLE_GEMINI_BASE_URL=http://127.0.0.1:8080` (or your `--host/--port`)
+  - selected provider key and session model env vars
+- Disable auto-write:
+
+```bash
+python3 proxy_app.py --no-auto-write
+```
+
+- Write proxy env vars to a custom file:
+
+```bash
+python3 proxy_app.py --write-env ~/.gemini/.env
+```
+
 - Foreground mode (stay attached to terminal):
 
 ```bash
@@ -142,22 +162,31 @@ python3 proxy_app.py --foreground
 ```
 
 - Probe strategy in proxy mode:
-  - Probe cheap providers first.
-  - Run expensive probe stage only if all cheap results fail or are slower than `5000ms`.
+  - Background probe runs every `600s` (10 minutes) by default (`--probe-interval`).
+  - Marks providers unhealthy on timeout, HTTP 5xx, or consecutive failures.
+  - Maintains moving average latency using the last 5 successful pings (`--latency-window`).
+  - Uses min-max normalized `input_price` + latency score:
+    - `Balance_Score = (alpha * normalized_price) + ((1-alpha) * normalized_latency)`
+    - Lower score is better.
+  - Sticky selection: keeps current healthy provider unless a challenger is significantly better
+    (default `20%` lower score via `--sticky-improvement-threshold`).
 - Optional tuning:
 
 ```bash
-python3 proxy_app.py --probe-expensive-threshold-ms 5000 --probe-expensive-attempts 1
+python3 proxy_app.py --probe-interval 600 --alpha 0.5 --sticky-improvement-threshold 0.2
+python3 proxy_app.py --latency-window 5 --failure-threshold 2
 ```
 
+- Live request fallback:
+  - If active provider fails on real traffic (timeout, rate-limit, 5xx), it is immediately
+    marked unhealthy.
+  - Proxy re-elects the next best healthy provider and retries the same request automatically.
 - Default logs are concise status lines:
-  - `[probe-stage][cheap] WORKING healthy=3/7 fastest=uniapi-0.5 (1481.5ms)`
-  - `[probe-stage][cheap] 01 yunwu-1=WORKING latency=1556.0ms`
-  - `[probe-stage][cheap] 05 yunwu-2=NOT_WORKING latency=2101.3ms reason=HTTP 500: quota error ...`
-  - `[probe-stage][expensive] SKIPPED reason=cheap_healthy_within_threshold threshold=5000.0ms`
-  - `[probe-status] WORKING selected=uniapi-0.5 source=cheap latency=1481.5ms`
-  - `[probe-status] NOT_WORKING reason=...`
-- Enable per-provider details only when needed:
+  - `[2026-03-07 14:20:00+0800] [probe-status] WORKING healthy=5/8 selected=foo score=0.1842 latency=132.1ms reason=sticky_keep`
+  - `[2026-03-07 14:20:00+0800] [probe-provider] foo=WORKING avg_latency=132.1ms score=0.1842 fails=0`
+  - `[2026-03-07 14:20:01+0800] [live] provider=foo failure=HTTP 500: ...`
+  - `[2026-03-07 14:20:01+0800] [route] failover from=foo to=bar reason=select_best`
+- Enable extra per-provider probe fields (probe result, input price, flags, error):
 
 ```bash
 python3 proxy_app.py --probe-detail
@@ -183,13 +212,14 @@ curl -sS http://127.0.0.1:8080/_health
 
 ## Optional per-provider fields
 
+- `input_price` (required for `proxy_app.py` scoring)
 - `test_path` (optional, overrides model-based probe URL)
 - `test_method` (optional, default: `POST` for model probe, `GET` when `test_path` is set)
 - `test_body` (optional custom body for POST/PUT/PATCH probe methods)
 - `model` (probe model, default: `gemini-3-flash-preview`)
 - `session_model` (exported runtime model, default: `gemini-3-pro-preview`)
-- `cheap_only` (optional bool, only participate in cheap stage)
-- `expensive_only` (optional bool, only participate in expensive stage)
+- `cheap_only` (optional bool metadata/filter flag)
+- `expensive_only` (optional bool metadata/filter flag)
 - `use_query_key` (default: `true`)
 - `use_header_key` (default: `true`)
 - `header_key_name` (default: `x-goog-api-key`)
