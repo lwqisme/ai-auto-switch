@@ -1,11 +1,16 @@
 import argparse
 import concurrent.futures
 import json
+import os
 import re
+import ssl
 import subprocess
 import sys
 import threading
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 from datetime import datetime
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -16,30 +21,67 @@ import uvicorn
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
-import switch
-
 DEFAULT_CONFIG_PATH = Path(__file__).with_name("providers.json")
+DEFAULT_TEST_MODEL = "gemini-3-flash-preview"
+DEFAULT_SESSION_MODEL = "gemini-3-pro-preview"
+DEFAULT_GEMINI_ENV_FILE = "~/.gemini/.env"
+DEFAULT_CA_BUNDLE_CANDIDATES = (
+    "/etc/ssl/cert.pem",
+    "/etc/ssl/certs/ca-certificates.crt",
+    "/usr/local/etc/openssl@3/cert.pem",
+    "/opt/homebrew/etc/openssl@3/cert.pem",
+)
+ENV_KEYS_TO_SET = (
+    "GOOGLE_GEMINI_BASE_URL",
+    "GEMINI_API_KEY",
+    "GOOGLE_GEMINI_API_KEY",
+    "GEMINI_MODEL",
+    "GOOGLE_GEMINI_MODEL",
+)
+SAFE_ENV_VALUE = re.compile(r"^[A-Za-z0-9._:/@%+=-]+$")
 DEFAULT_PROXY_HOST = "127.0.0.1"
-DEFAULT_PROXY_PORT = 8080
+DEFAULT_PROXY_PORT = 18080
 DEFAULT_PROBE_INTERVAL_SECONDS = 600.0
 DEFAULT_PROBE_ATTEMPTS = 1
 DEFAULT_PROBE_TIMEOUT_SECONDS = 5.0
 DEFAULT_PROBE_TOTAL_TIMEOUT_SECONDS = 10.0
 DEFAULT_SCORE_ALPHA = 0.7
-DEFAULT_STICKY_IMPROVEMENT_THRESHOLD = 0.2
+DEFAULT_STICKY_IMPROVEMENT_THRESHOLD = 0.0
 DEFAULT_LATENCY_WINDOW = 5
 DEFAULT_FAILURE_THRESHOLD = 2
 DEFAULT_BACKGROUND_LOG_FILE = "/tmp/ai-auto-switch-proxy.log"
-DEFAULT_PROXY_ENV_FILE = switch.DEFAULT_GEMINI_ENV_FILE
+DEFAULT_PROXY_ENV_FILE = DEFAULT_GEMINI_ENV_FILE
 RUMPS_INSTALL_CMD = "python3 -m pip install --user rumps"
 
 RETRYABLE_LIVE_STATUS_CODES = {408, 409, 425, 429, 500, 502, 503, 504}
 HTTP_STATUS_PATTERN = re.compile(r"HTTP\s+(\d{3})")
 
 
+class ConfigError(Exception):
+    pass
+
+
+@dataclass
+class Provider:
+    name: str
+    base_url: str
+    api_key: str
+    model: str = DEFAULT_TEST_MODEL
+    session_model: str = DEFAULT_SESSION_MODEL
+    cheap_only: bool = False
+    expensive_only: bool = False
+    test_path: str | None = None
+    test_method: str = "POST"
+    test_body: Any | None = None
+    use_query_key: bool = True
+    use_header_key: bool = True
+    header_key_name: str = "x-goog-api-key"
+    headers: dict[str, str] | None = None
+
+
 @dataclass
 class ProviderRuntime:
-    provider: switch.Provider
+    provider: Provider
     input_price: float
     is_healthy: bool = False
     consecutive_failures: int = 0
@@ -69,6 +111,7 @@ SCORE_ALPHA = DEFAULT_SCORE_ALPHA
 STICKY_IMPROVEMENT_THRESHOLD = DEFAULT_STICKY_IMPROVEMENT_THRESHOLD
 LATENCY_WINDOW_SIZE = DEFAULT_LATENCY_WINDOW
 FAILURE_THRESHOLD = DEFAULT_FAILURE_THRESHOLD
+USE_EXPENSIVE_FALLBACK_ONLY = False
 
 ENV_WRITE_TARGET: Path | None = None
 PROXY_PUBLIC_BASE_URL: str | None = None
@@ -76,6 +119,265 @@ LAST_WRITTEN_ENV: dict[str, str] | None = None
 ENV_WRITE_LOCK = threading.Lock()
 
 app = FastAPI(title="AI Auto Switch Proxy")
+
+
+def mask_key(key: str) -> str:
+    if len(key) <= 8:
+        return "*" * len(key)
+    return f"{key[:4]}...{key[-4:]}"
+
+
+def format_env_value(value: str) -> str:
+    if SAFE_ENV_VALUE.match(value):
+        return value
+    escaped = value.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
+    return f'"{escaped}"'
+
+
+def write_env_file(path: Path, kv: dict[str, str]) -> None:
+    path = path.expanduser()
+    existing_lines: list[str] = []
+    if path.exists():
+        existing_lines = path.read_text(encoding="utf-8").splitlines()
+
+    remaining = dict(kv)
+    out_lines: list[str] = []
+    key_pattern = re.compile(r"^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=")
+
+    for line in existing_lines:
+        match = key_pattern.match(line)
+        if not match:
+            out_lines.append(line)
+            continue
+
+        key = match.group(1)
+        if key in remaining:
+            out_lines.append(f"{key}={format_env_value(remaining.pop(key))}")
+        else:
+            out_lines.append(line)
+
+    for key in ENV_KEYS_TO_SET:
+        if key in remaining:
+            out_lines.append(f"{key}={format_env_value(remaining.pop(key))}")
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(out_lines).rstrip() + "\n", encoding="utf-8")
+
+
+def load_providers(
+    config_path: Path,
+    default_test_path: str | None,
+    default_model: str,
+    default_session_model: str,
+) -> list[Provider]:
+    try:
+        raw = json.loads(config_path.read_text(encoding="utf-8"))
+    except FileNotFoundError as err:
+        raise ConfigError(f"Config file not found: {config_path}") from err
+    except json.JSONDecodeError as err:
+        raise ConfigError(f"Invalid JSON in config: {config_path} ({err})") from err
+
+    if isinstance(raw, dict):
+        items = raw.get("providers")
+        if items is None:
+            raise ConfigError('Config object must include a "providers" array.')
+    elif isinstance(raw, list):
+        items = raw
+    else:
+        raise ConfigError("Config must be either a list or an object with a providers list.")
+
+    if not isinstance(items, list) or not items:
+        raise ConfigError("Providers list is empty.")
+
+    providers: list[Provider] = []
+    for idx, item in enumerate(items, start=1):
+        if not isinstance(item, dict):
+            raise ConfigError(f"Provider entry #{idx} must be a JSON object.")
+
+        name = str(item.get("name") or f"provider-{idx}")
+        base_url = str(item.get("base_url") or "").strip()
+        if not base_url:
+            raise ConfigError(f'Provider "{name}" missing required field: base_url')
+
+        api_key = str(item.get("api_key") or "").strip()
+        api_key_env = str(item.get("api_key_env") or "").strip()
+        if not api_key and api_key_env:
+            api_key = os.getenv(api_key_env, "").strip()
+        if not api_key:
+            hint = f' or set env var "{api_key_env}"' if api_key_env else ""
+            raise ConfigError(
+                f'Provider "{name}" missing api_key{hint}. '
+                "Use api_key or api_key_env in config."
+            )
+
+        model = str(item.get("model") or default_model).strip()
+        if not model:
+            raise ConfigError(f'Provider "{name}" missing model.')
+
+        session_model = str(item.get("session_model") or default_session_model).strip()
+        if not session_model:
+            raise ConfigError(f'Provider "{name}" missing session_model.')
+
+        cheap_only = bool(item.get("cheap_only", False))
+        expensive_only = bool(item.get("expensive_only", False))
+        if cheap_only and expensive_only:
+            raise ConfigError(
+                f'Provider "{name}" cannot set both cheap_only and expensive_only.'
+            )
+
+        raw_test_path = item.get("test_path", default_test_path)
+        test_path: str | None = None
+        if raw_test_path is not None:
+            test_path_str = str(raw_test_path).strip()
+            if test_path_str:
+                test_path = test_path_str
+
+        raw_test_method = item.get("test_method")
+        if raw_test_method is None:
+            test_method = "GET" if test_path else "POST"
+        else:
+            test_method = str(raw_test_method).strip().upper()
+        if test_method not in {"GET", "POST", "HEAD", "PUT", "PATCH", "DELETE"}:
+            raise ConfigError(
+                f'Provider "{name}" has unsupported test_method "{test_method}".'
+            )
+
+        test_body = item.get("test_body")
+        if test_body is not None and test_method not in {"POST", "PUT", "PATCH"}:
+            raise ConfigError(
+                f'Provider "{name}" sets test_body but test_method "{test_method}" does not use a body.'
+            )
+
+        headers = item.get("headers") or {}
+        if not isinstance(headers, dict):
+            raise ConfigError(f'Provider "{name}" field "headers" must be an object.')
+
+        providers.append(
+            Provider(
+                name=name,
+                base_url=base_url,
+                api_key=api_key,
+                model=model,
+                session_model=session_model,
+                cheap_only=cheap_only,
+                expensive_only=expensive_only,
+                test_path=test_path,
+                test_method=test_method,
+                test_body=test_body,
+                use_query_key=bool(item.get("use_query_key", True)),
+                use_header_key=bool(item.get("use_header_key", True)),
+                header_key_name=str(item.get("header_key_name") or "x-goog-api-key"),
+                headers={str(k): str(v) for k, v in headers.items()},
+            )
+        )
+
+    return providers
+
+
+def resolve_probe_path(provider: Provider) -> str:
+    if provider.test_path:
+        return provider.test_path if provider.test_path.startswith("/") else f"/{provider.test_path}"
+
+    model_name = provider.model.strip()
+    if model_name.startswith("models/"):
+        model_name = model_name[len("models/") :]
+    model_name = urllib.parse.quote(model_name, safe="._-")
+    return f"/v1beta/models/{model_name}:generateContent"
+
+
+def build_probe_url(provider: Provider) -> str:
+    base = provider.base_url.rstrip("/")
+    path = resolve_probe_path(provider)
+    url = f"{base}{path}"
+    if provider.use_query_key:
+        sep = "&" if "?" in url else "?"
+        key_qs = urllib.parse.urlencode({"key": provider.api_key})
+        url = f"{url}{sep}{key_qs}"
+    return url
+
+
+def default_generate_probe_body() -> dict[str, Any]:
+    return {
+        "contents": [{"parts": [{"text": "ping"}]}],
+        "generationConfig": {"maxOutputTokens": 1},
+    }
+
+
+def probe_once(
+    provider: Provider, timeout_s: float, insecure: bool, ca_file: str | None
+) -> tuple[bool, float | None, str | None]:
+    url = build_probe_url(provider)
+    headers: dict[str, str] = {
+        "User-Agent": "ai-auto-switch/1.0",
+        "Accept": "application/json",
+    }
+    if provider.use_header_key:
+        headers[provider.header_key_name] = provider.api_key
+    if provider.headers:
+        headers.update(provider.headers)
+
+    request_body: bytes | None = None
+    if provider.test_method in {"POST", "PUT", "PATCH"}:
+        body = provider.test_body
+        if body is None and provider.test_path is None:
+            body = default_generate_probe_body()
+        if body is not None:
+            request_body = json.dumps(body, ensure_ascii=True).encode("utf-8")
+            headers["Content-Type"] = "application/json"
+
+    req = urllib.request.Request(
+        url=url, data=request_body, method=provider.test_method, headers=headers
+    )
+    ssl_context: ssl.SSLContext | None = None
+    if insecure:
+        ssl_context = ssl.create_default_context()
+        ssl_context.check_hostname = False
+        ssl_context.verify_mode = ssl.CERT_NONE
+    elif ca_file:
+        ssl_context = ssl.create_default_context(cafile=ca_file)
+
+    start = time.perf_counter()
+    try:
+        with urllib.request.urlopen(req, timeout=timeout_s, context=ssl_context) as resp:
+            _ = resp.read(64)
+            status = getattr(resp, "status", 200)
+            elapsed_ms = (time.perf_counter() - start) * 1000.0
+            if 200 <= status < 300:
+                return True, elapsed_ms, None
+            return False, elapsed_ms, f"HTTP {status}"
+    except urllib.error.HTTPError as err:
+        elapsed_ms = (time.perf_counter() - start) * 1000.0
+        body = err.read(120).decode("utf-8", errors="ignore").strip()
+        extra = f": {body}" if body else ""
+        return False, elapsed_ms, f"HTTP {err.code}{extra}"
+    except urllib.error.URLError as err:
+        elapsed_ms = (time.perf_counter() - start) * 1000.0
+        return False, elapsed_ms, f"URL error: {err.reason}"
+    except TimeoutError:
+        elapsed_ms = (time.perf_counter() - start) * 1000.0
+        return False, elapsed_ms, "Timeout"
+    except Exception as err:  # pragma: no cover
+        elapsed_ms = (time.perf_counter() - start) * 1000.0
+        return False, elapsed_ms, f"{type(err).__name__}: {err}"
+
+
+def resolve_ca_file(user_ca_file: str | None) -> str | None:
+    if user_ca_file:
+        path = Path(user_ca_file).expanduser()
+        if not path.is_file():
+            raise ConfigError(f"CA bundle file not found: {path}")
+        return str(path)
+
+    paths = ssl.get_default_verify_paths()
+    cafile_ok = bool(paths.cafile and Path(paths.cafile).is_file())
+    capath_ok = bool(paths.capath and Path(paths.capath).is_dir())
+    if cafile_ok or capath_ok:
+        return None
+
+    for candidate in DEFAULT_CA_BUNDLE_CANDIDATES:
+        if Path(candidate).is_file():
+            return candidate
+    return None
 
 
 def print_rumps_install_hint() -> None:
@@ -112,7 +414,7 @@ def build_public_proxy_base_url(host: str, port: int) -> str:
     return f"http://{resolved_host}:{port}"
 
 
-def maybe_write_proxy_env(provider: switch.Provider) -> None:
+def maybe_write_proxy_env(provider: Provider) -> None:
     global LAST_WRITTEN_ENV
     if not ENV_WRITE_TARGET or not PROXY_PUBLIC_BASE_URL:
         return
@@ -128,13 +430,13 @@ def maybe_write_proxy_env(provider: switch.Provider) -> None:
     with ENV_WRITE_LOCK:
         if LAST_WRITTEN_ENV == selected_env:
             return
-        switch.write_env_file(ENV_WRITE_TARGET, selected_env)
+        write_env_file(ENV_WRITE_TARGET, selected_env)
         LAST_WRITTEN_ENV = dict(selected_env)
 
     _log(
         f"[env] updated file={ENV_WRITE_TARGET} "
         f"base_url={PROXY_PUBLIC_BASE_URL} "
-        f"provider={provider.name} key={switch.mask_key(provider.api_key)}"
+        f"provider={provider.name} key={mask_key(provider.api_key)}"
     )
 
 
@@ -167,11 +469,11 @@ def _load_raw_provider_items(config_path: Path) -> list[dict[str, Any]]:
 def load_runtime_providers(config_path: str) -> list[ProviderRuntime]:
     path = Path(config_path).expanduser()
     raw_items = _load_raw_provider_items(path)
-    parsed_providers = switch.load_providers(
+    parsed_providers = load_providers(
         path,
         None,
-        switch.DEFAULT_TEST_MODEL,
-        switch.DEFAULT_SESSION_MODEL,
+        DEFAULT_TEST_MODEL,
+        DEFAULT_SESSION_MODEL,
     )
     if len(parsed_providers) != len(raw_items):
         raise ValueError("Internal provider parse mismatch.")
@@ -300,7 +602,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--ca-file",
         default=None,
-        help="CA bundle for probe requests. Defaults to switch.py auto-resolution.",
+        help="CA bundle for probe requests. Defaults to built-in auto-resolution.",
     )
     parser.add_argument(
         "--menubar",
@@ -450,11 +752,25 @@ def _is_significantly_better(candidate_score: float, active_score: float) -> boo
     return improvement >= STICKY_IMPROVEMENT_THRESHOLD
 
 
+def _is_skipped_probe_error(error: str | None) -> bool:
+    return bool(error and error.startswith("Skipped:"))
+
+
+def _provider_is_eligible_locked(provider: Provider) -> bool:
+    if USE_EXPENSIVE_FALLBACK_ONLY:
+        return provider.expensive_only
+    return not provider.expensive_only
+
+
 def _healthy_runtimes_locked() -> list[ProviderRuntime]:
     out: list[ProviderRuntime] = []
     for name in RUNTIME_ORDER:
         item = RUNTIME_BY_NAME[name]
-        if item.is_healthy and item.moving_avg_latency_ms is not None:
+        if (
+            _provider_is_eligible_locked(item.provider)
+            and item.is_healthy
+            and item.moving_avg_latency_ms is not None
+        ):
             out.append(item)
     return out
 
@@ -490,6 +806,7 @@ def _elect_active_provider_locked() -> tuple[ProviderRuntime | None, bool, str]:
     global ACTIVE_PROVIDER_NAME
 
     healthy = _recompute_scores_locked()
+    healthy_names = {item.provider.name for item in healthy}
     previous_name = ACTIVE_PROVIDER_NAME
     previous = RUNTIME_BY_NAME.get(previous_name) if previous_name else None
 
@@ -509,7 +826,12 @@ def _elect_active_provider_locked() -> tuple[ProviderRuntime | None, bool, str]:
     )
     best = ranked[0]
 
-    if previous and previous.is_healthy and previous.balance_score is not None:
+    if (
+        previous
+        and previous.provider.name in healthy_names
+        and previous.is_healthy
+        and previous.balance_score is not None
+    ):
         if (
             best.provider.name != previous.provider.name
             and best.balance_score is not None
@@ -531,6 +853,7 @@ def _initialize_runtime(providers: list[ProviderRuntime]) -> None:
     global ACTIVE_PROVIDER_NAME
     global LAST_PROBE_ERROR
     global LAST_PROBE_TIME_UNIX
+    global USE_EXPENSIVE_FALLBACK_ONLY
 
     with RUNTIME_LOCK:
         RUNTIME_BY_NAME = {item.provider.name: item for item in providers}
@@ -538,6 +861,7 @@ def _initialize_runtime(providers: list[ProviderRuntime]) -> None:
         ACTIVE_PROVIDER_NAME = None
         LAST_PROBE_ERROR = None
         LAST_PROBE_TIME_UNIX = None
+        USE_EXPENSIVE_FALLBACK_ONLY = False
 
 
 def _log_probe_cycle(result_by_name: dict[str, tuple[bool, float | None, str | None]], selection_reason: str) -> None:
@@ -593,11 +917,11 @@ def _log_probe_cycle(result_by_name: dict[str, tuple[bool, float | None, str | N
             _log(line)
 
 
-def _probe_provider_cycle(provider: switch.Provider) -> tuple[bool, float | None, str | None]:
+def _probe_provider_cycle(provider: Provider) -> tuple[bool, float | None, str | None]:
     last_latency: float | None = None
     last_error: str | None = None
     for _ in range(PROBE_ATTEMPTS):
-        ok, latency_ms, error = switch.probe_once(
+        ok, latency_ms, error = probe_once(
             provider,
             timeout_s=PROBE_TIMEOUT_SECONDS,
             insecure=PROBE_INSECURE,
@@ -610,29 +934,19 @@ def _probe_provider_cycle(provider: switch.Provider) -> tuple[bool, float | None
     return False, last_latency, last_error or "Probe failed"
 
 
-def run_probe_once() -> switch.Provider | None:
-    global ACTIVE_PROVIDER_NAME
-    global LAST_PROBE_ERROR
-    global LAST_PROBE_TIME_UNIX
-
-    with RUNTIME_LOCK:
-        names = list(RUNTIME_ORDER)
-        providers = [RUNTIME_BY_NAME[name].provider for name in names]
-
-    if not providers:
-        with RUNTIME_LOCK:
-            LAST_PROBE_TIME_UNIX = time.time()
-            LAST_PROBE_ERROR = "No providers configured."
-            ACTIVE_PROVIDER_NAME = None
-        return None
-
-    deadline = time.monotonic() + PROBE_TOTAL_TIMEOUT_SECONDS
+def _probe_provider_batch(
+    names: list[str],
+    provider_by_name: dict[str, Provider],
+    deadline: float,
+) -> dict[str, tuple[bool, float | None, str | None]]:
     result_by_name: dict[str, tuple[bool, float | None, str | None]] = {}
+    if not names:
+        return result_by_name
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, len(providers))) as executor:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, len(names))) as executor:
         futures: dict[concurrent.futures.Future[tuple[bool, float | None, str | None]], str] = {}
-        for name, provider in zip(names, providers):
-            futures[executor.submit(_probe_provider_cycle, provider)] = name
+        for name in names:
+            futures[executor.submit(_probe_provider_cycle, provider_by_name[name])] = name
 
         remaining = max(0.0, deadline - time.monotonic())
         done, not_done = concurrent.futures.wait(futures.keys(), timeout=remaining)
@@ -642,20 +956,84 @@ def run_probe_once() -> switch.Provider | None:
             try:
                 result_by_name[name] = future.result()
             except Exception as err:
-                result_by_name[name] = (False, None, f"Probe exception: {type(err).__name__}: {err}")
+                result_by_name[name] = (
+                    False,
+                    None,
+                    f"Probe exception: {type(err).__name__}: {err}",
+                )
 
         for future in not_done:
             name = futures[future]
             future.cancel()
             result_by_name[name] = (False, None, "Probe total timeout exceeded")
 
-    env_update_provider: switch.Provider | None = None
-    selection_reason = "none"
-    selected_provider: switch.Provider | None = None
+    return result_by_name
+
+
+def run_probe_once() -> Provider | None:
+    global ACTIVE_PROVIDER_NAME
+    global LAST_PROBE_ERROR
+    global LAST_PROBE_TIME_UNIX
+    global USE_EXPENSIVE_FALLBACK_ONLY
+
+    with RUNTIME_LOCK:
+        names = list(RUNTIME_ORDER)
+        provider_by_name = {name: RUNTIME_BY_NAME[name].provider for name in names}
+        cheap_names = [name for name in names if not provider_by_name[name].expensive_only]
+        expensive_names = [name for name in names if provider_by_name[name].expensive_only]
+
+    if not names:
+        with RUNTIME_LOCK:
+            LAST_PROBE_TIME_UNIX = time.time()
+            LAST_PROBE_ERROR = "No providers configured."
+            ACTIVE_PROVIDER_NAME = None
+            USE_EXPENSIVE_FALLBACK_ONLY = False
+        return None
+
+    deadline = time.monotonic() + PROBE_TOTAL_TIMEOUT_SECONDS
+    result_by_name: dict[str, tuple[bool, float | None, str | None]] = {}
+    stage_reason = "cheap_probe"
+
+    cheap_results = _probe_provider_batch(cheap_names, provider_by_name, deadline)
+    result_by_name.update(cheap_results)
+    cheap_success_names = {name for name, (ok, _, _) in cheap_results.items() if ok}
+
+    run_expensive_fallback = not cheap_success_names and bool(expensive_names)
+    expensive_results: dict[str, tuple[bool, float | None, str | None]] = {}
+    expensive_success_names: set[str] = set()
+
+    if run_expensive_fallback:
+        stage_reason = "expensive_fallback"
+        expensive_results = _probe_provider_batch(expensive_names, provider_by_name, deadline)
+        result_by_name.update(expensive_results)
+        expensive_success_names = {
+            name for name, (ok, _, _) in expensive_results.items() if ok
+        }
+    else:
+        for name in expensive_names:
+            result_by_name[name] = (
+                False,
+                None,
+                "Skipped: cheap providers healthy",
+            )
+
+    force_unhealthy_cheap = bool(cheap_names) and not cheap_success_names
+    force_unhealthy_expensive = (
+        run_expensive_fallback
+        and bool(expensive_names)
+        and not expensive_success_names
+    )
+
+    env_update_provider: Provider | None = None
+    selection_reason = stage_reason
+    selected_provider: Provider | None = None
     now_unix = time.time()
+    cheap_name_set = set(cheap_names)
+    expensive_name_set = set(expensive_names)
 
     with RUNTIME_LOCK:
         LAST_PROBE_TIME_UNIX = now_unix
+        USE_EXPENSIVE_FALLBACK_ONLY = run_expensive_fallback
 
         for name in names:
             runtime = RUNTIME_BY_NAME[name]
@@ -680,17 +1058,26 @@ def run_probe_once() -> switch.Provider | None:
                     runtime.moving_avg_latency_ms = None
                 continue
 
+            if _is_skipped_probe_error(error):
+                runtime.last_error = error
+                continue
+
             runtime.consecutive_failures += 1
             runtime.last_error = error or "Probe failed"
 
             immediate_unhealthy = _error_is_timeout(runtime.last_error) or _error_is_http_5xx(
                 runtime.last_error
             )
+            if name in cheap_name_set and force_unhealthy_cheap:
+                immediate_unhealthy = True
+            if name in expensive_name_set and force_unhealthy_expensive:
+                immediate_unhealthy = True
             if immediate_unhealthy or runtime.consecutive_failures >= FAILURE_THRESHOLD:
                 runtime.is_healthy = False
                 runtime.balance_score = None
 
-        selected_runtime, changed, selection_reason = _elect_active_provider_locked()
+        selected_runtime, changed, elect_reason = _elect_active_provider_locked()
+        selection_reason = f"{stage_reason}:{elect_reason}"
 
         if selected_runtime:
             selected_provider = selected_runtime.provider
@@ -701,9 +1088,9 @@ def run_probe_once() -> switch.Provider | None:
             errors = [
                 item.last_error
                 for item in (RUNTIME_BY_NAME[name] for name in RUNTIME_ORDER)
-                if item.last_error
+                if item.last_error and _provider_is_eligible_locked(item.provider)
             ]
-            LAST_PROBE_ERROR = errors[0] if errors else "No healthy provider."
+            LAST_PROBE_ERROR = errors[0] if errors else "No healthy eligible provider."
 
     _log_probe_cycle(result_by_name, selection_reason)
 
@@ -773,6 +1160,9 @@ def _build_health_payload() -> dict[str, Any]:
             "last_probe_latency_ms": active.moving_avg_latency_ms if active else None,
             # New routing metadata.
             "active_provider": active.provider.name if active else None,
+            "routing_stage": (
+                "expensive_fallback" if USE_EXPENSIVE_FALLBACK_ONLY else "cheap_primary"
+            ),
             "score_alpha": SCORE_ALPHA,
             "sticky_improvement_threshold": STICKY_IMPROVEMENT_THRESHOLD,
             "latency_window": LATENCY_WINDOW_SIZE,
@@ -782,11 +1172,11 @@ def _build_health_payload() -> dict[str, Any]:
     return payload
 
 
-def _select_provider_for_request() -> tuple[switch.Provider | None, str | None, switch.Provider | None]:
-    env_update_provider: switch.Provider | None = None
+def _select_provider_for_request() -> tuple[Provider | None, str | None, Provider | None]:
+    env_update_provider: Provider | None = None
     with RUNTIME_LOCK:
         active = RUNTIME_BY_NAME.get(ACTIVE_PROVIDER_NAME) if ACTIVE_PROVIDER_NAME else None
-        if active and active.is_healthy:
+        if active and active.is_healthy and _provider_is_eligible_locked(active.provider):
             return active.provider, None, None
 
         selected_runtime, changed, selection_reason = _elect_active_provider_locked()
@@ -802,9 +1192,9 @@ def _select_provider_for_request() -> tuple[switch.Provider | None, str | None, 
 
 def _mark_provider_unhealthy_from_live_failure(
     provider_name: str, error: str
-) -> tuple[switch.Provider | None, switch.Provider | None]:
+) -> tuple[Provider | None, Provider | None]:
     global LAST_PROBE_ERROR
-    env_update_provider: switch.Provider | None = None
+    env_update_provider: Provider | None = None
 
     with RUNTIME_LOCK:
         runtime = RUNTIME_BY_NAME.get(provider_name)
@@ -851,7 +1241,7 @@ async def _send_request_to_provider(
     request: Request,
     path: str,
     body: bytes,
-    provider: switch.Provider,
+    provider: Provider,
 ) -> tuple[httpx.AsyncClient | None, httpx.Response | None, str | None]:
     base = provider.base_url.rstrip("/")
     target_url = f"{base}/{path.lstrip('/')}"
@@ -986,19 +1376,71 @@ def run_optional_menubar() -> bool:
     class ProxyMenuBarApp(rumps.App):
         def __init__(self):
             super().__init__("🤖 Proxy")
-            self.menu = [
-                rumps.MenuItem("Force Probe Now", callback=self.force_probe),
-                rumps.separator,
-                rumps.MenuItem("Status in terminal", callback=None),
-            ]
             self._refresh_title()
             self._timer = rumps.Timer(self._refresh_title, 2)
             self._timer.start()
+
+        def _build_menu(
+            self,
+            provider_snapshots: list[
+                tuple[str, bool, float | None, float | None, float | None, float]
+            ],
+            active_name: str | None,
+        ) -> None:
+            provider_snapshots.sort(
+                key=lambda item: (
+                    item[2] is None,
+                    item[2] if item[2] is not None else float("inf"),
+                    item[0],
+                )
+            )
+
+            menu_items: list[Any] = [rumps.MenuItem("Force Probe Now", callback=self.force_probe)]
+            for name, is_healthy, score, avg_latency_ms, last_probe_ts, input_price in provider_snapshots:
+                marker = "⭐" if name == active_name else "  "
+                display_name = f"{name} ({input_price:g})"
+                if is_healthy:
+                    status = "🟢"
+                    score_str = "-" if score is None else f"{score:.3f}"
+                    if avg_latency_ms is not None:
+                        detail = f"score={score_str} {int(avg_latency_ms)}ms"
+                    else:
+                        detail = f"score={score_str}"
+                elif last_probe_ts is None:
+                    status = "🟡"
+                    detail = "INIT"
+                else:
+                    status = "🔴"
+                    detail = "DOWN"
+                menu_items.append(
+                    rumps.MenuItem(f"{marker} {status} {display_name} {detail}", callback=None)
+                )
+
+            menu_items.append(rumps.MenuItem("Status in terminal", callback=None))
+            menu_items.append(rumps.MenuItem("Quit", callback=self.quit_app))
+            # rumps updates existing menu entries when assigning iterables,
+            # so clear first to avoid unbounded growth every refresh cycle.
+            self.menu.clear()
+            self.menu = menu_items
 
         def _refresh_title(self, _=None):
             with RUNTIME_LOCK:
                 active = RUNTIME_BY_NAME.get(ACTIVE_PROVIDER_NAME) if ACTIVE_PROVIDER_NAME else None
                 error = LAST_PROBE_ERROR
+                active_name = ACTIVE_PROVIDER_NAME
+                provider_snapshots = [
+                    (
+                        name,
+                        RUNTIME_BY_NAME[name].is_healthy,
+                        RUNTIME_BY_NAME[name].balance_score,
+                        RUNTIME_BY_NAME[name].moving_avg_latency_ms,
+                        RUNTIME_BY_NAME[name].last_probe_time_unix,
+                        RUNTIME_BY_NAME[name].input_price,
+                    )
+                    for name in RUNTIME_ORDER
+                ]
+
+            self._build_menu(provider_snapshots, active_name)
 
             if active:
                 if active.moving_avg_latency_ms is not None:
@@ -1013,6 +1455,9 @@ def run_optional_menubar() -> bool:
         def force_probe(self, _):
             run_probe_once()
             self._refresh_title()
+
+        def quit_app(self, _):
+            rumps.quit_application()
 
     try:
         ProxyMenuBarApp().run()
@@ -1093,7 +1538,7 @@ def main() -> int:
     LATENCY_WINDOW_SIZE = args.latency_window
     FAILURE_THRESHOLD = args.failure_threshold
     try:
-        PROBE_CA_FILE = None if PROBE_INSECURE else switch.resolve_ca_file(args.ca_file)
+        PROBE_CA_FILE = None if PROBE_INSECURE else resolve_ca_file(args.ca_file)
     except Exception as err:
         _log(f"Invalid TLS config: {err}")
         return 2
@@ -1135,13 +1580,18 @@ def main() -> int:
         else:
             _log("[menubar] enabled (default mode).")
             # rumps must run on the main thread.
-            threading.Thread(
+            server_thread = threading.Thread(
                 target=run_uvicorn_server, args=(args.host, args.port), daemon=True
-            ).start()
+            )
+            server_thread.start()
             menubar_started = run_optional_menubar()
             if menubar_started:
                 return 0
             _log("[menubar] falling back to headless server mode.")
+            if server_thread.is_alive():
+                _log("[menubar] keeping existing headless server thread alive.")
+                server_thread.join()
+                return 0
 
     run_uvicorn_server(args.host, args.port)
     return 0

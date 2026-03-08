@@ -13,18 +13,13 @@ Defaults are split:
 
 ## What this does
 
-- Tests connectivity/latency against each provider via
-  `POST /v1beta/models/{model}:generateContent` (tiny ping payload) by default.
-- Uses multiple attempts per provider and ranks by:
-  - higher success count first
-  - lower median latency second
-- Probes providers in parallel and enforces a global runtime cap (`--total-timeout`).
-- Uses two stages:
-  - cheap probe first (fast, low cost)
-  - expensive fallback probe only when all cheap results are failed or slower than 5000ms
-- Activates the winner by:
-  - printing shell exports, or
-  - writing/updating an env file.
+- Runs a local Gemini-compatible proxy with background health probing.
+- Probes providers in two stages:
+  - probes cheap-stage providers first (all providers where `expensive_only != true`)
+  - probes expensive-stage providers only when all cheap-stage probes fail/timeout
+- Ranks healthy providers by normalized `input_price` + latency score.
+- Routes live requests to the selected healthy provider and retries on retryable failures.
+- Auto-updates `~/.gemini/.env` by default with local proxy URL + selected provider creds/model.
 
 ## Config
 
@@ -62,69 +57,6 @@ Then fill your providers in `providers.json`:
 Recommended: use `api_key_env` instead of plain `api_key`.
 For `proxy_app.py` score-based routing, each provider must include `input_price`.
 
-## Usage
-
-Run probe only:
-
-```bash
-python3 switch.py --config providers.json --attempts 2 --timeout 8 --no-auto-write
-```
-
-Default run (auto-updates `~/.gemini/.env`):
-
-```bash
-python3 switch.py
-```
-
-Cap total script runtime (default is 20s):
-
-```bash
-python3 switch.py --config providers.json --total-timeout 20
-```
-
-Tune/disable expensive fallback behavior:
-
-```bash
-python3 switch.py --expensive-threshold-ms 5000 --expensive-attempts 1
-python3 switch.py --no-expensive-probe
-```
-
-Set/override model for all providers:
-
-```bash
-python3 switch.py --config providers.json --model gemini-3-flash-preview
-```
-
-Set/override real session model written to env:
-
-```bash
-python3 switch.py --config providers.json --session-model gemini-3-pro-preview
-```
-
-If a relay uses non-standard/self-signed TLS certs:
-
-```bash
-python3 switch.py --config providers.json --insecure
-```
-
-Specify a CA bundle explicitly (recommended over `--insecure`):
-
-```bash
-python3 switch.py --config providers.json --ca-file /etc/ssl/cert.pem
-```
-
-Activate in current shell:
-
-```bash
-eval "$(python3 switch.py --config providers.json --print-export)"
-```
-
-Write selected values into an env file:
-
-```bash
-python3 switch.py --config providers.json --write-env ~/.gemini/.env
-```
-
 ## proxy_app.py (local proxy)
 
 Install proxy runtime dependencies first:
@@ -141,7 +73,7 @@ python3 proxy_app.py
 
 - Log file default: `/tmp/ai-auto-switch-proxy.log`
 - By default, proxy mode auto-updates `~/.gemini/.env` with:
-  - `GOOGLE_GEMINI_BASE_URL=http://127.0.0.1:8080` (or your `--host/--port`)
+  - `GOOGLE_GEMINI_BASE_URL=http://127.0.0.1:18080` (or your `--host/--port`)
   - selected provider key and session model env vars
 - Disable auto-write:
 
@@ -161,15 +93,25 @@ python3 proxy_app.py --write-env ~/.gemini/.env
 python3 proxy_app.py --foreground
 ```
 
+- In menubar mode, the dropdown shows every provider with simple live status:
+  - Rows are sorted by score (lowest/best first; unknown score at bottom).
+  - `⭐ 🟢 provider score=0.184 123ms` (active healthy provider)
+  - `  🔴 provider DOWN` (currently unhealthy)
+  - `  🟡 provider INIT` (not probed yet)
+  - Includes `Quit` to exit the menubar app.
+
 - Probe strategy in proxy mode:
   - Background probe runs every `600s` (10 minutes) by default (`--probe-interval`).
+  - Probes cheap-stage providers first (`expensive_only != true`).
+  - Probes expensive-stage providers only when all cheap-stage probes fail/timeout.
   - Marks providers unhealthy on timeout, HTTP 5xx, or consecutive failures.
   - Maintains moving average latency using the last 5 successful pings (`--latency-window`).
   - Uses min-max normalized `input_price` + latency score:
     - `Balance_Score = (alpha * normalized_price) + ((1-alpha) * normalized_latency)`
     - Lower score is better.
-  - Sticky selection: keeps current healthy provider unless a challenger is significantly better
-    (default `20%` lower score via `--sticky-improvement-threshold`).
+  - Default selection always follows the lowest score (`--sticky-improvement-threshold 0.0`).
+  - Optional sticky behavior: keep current healthy provider unless a challenger is significantly
+    better (for example `20%` lower score via `--sticky-improvement-threshold 0.2`).
 - Optional tuning:
 
 ```bash
@@ -207,7 +149,7 @@ python3 proxy_app.py --headless
 Health check:
 
 ```bash
-curl -sS http://127.0.0.1:8080/_health
+curl -sS http://127.0.0.1:18080/_health
 ```
 
 ## Optional per-provider fields
@@ -218,8 +160,8 @@ curl -sS http://127.0.0.1:8080/_health
 - `test_body` (optional custom body for POST/PUT/PATCH probe methods)
 - `model` (probe model, default: `gemini-3-flash-preview`)
 - `session_model` (exported runtime model, default: `gemini-3-pro-preview`)
-- `cheap_only` (optional bool metadata/filter flag)
-- `expensive_only` (optional bool metadata/filter flag)
+- `cheap_only` (optional bool; excludes provider from expensive fallback stage)
+- `expensive_only` (optional bool; excludes provider from cheap stage, used only in fallback)
 - `use_query_key` (default: `true`)
 - `use_header_key` (default: `true`)
 - `header_key_name` (default: `x-goog-api-key`)
