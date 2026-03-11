@@ -1,5 +1,5 @@
 import argparse
-import concurrent.futures
+import asyncio
 import json
 import os
 import re
@@ -8,13 +8,11 @@ import subprocess
 import sys
 import threading
 import time
-import urllib.error
 import urllib.parse
-import urllib.request
 from datetime import datetime
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Coroutine, TypeVar
 
 import httpx
 import uvicorn
@@ -41,7 +39,8 @@ ENV_KEYS_TO_SET = (
 SAFE_ENV_VALUE = re.compile(r"^[A-Za-z0-9._:/@%+=-]+$")
 DEFAULT_PROXY_HOST = "127.0.0.1"
 DEFAULT_PROXY_PORT = 18080
-DEFAULT_PROBE_INTERVAL_SECONDS = 600.0
+DEFAULT_PROBE_INTERVAL_SECONDS = 60.0
+PROBE_INTERVAL_PRESETS_SECONDS = (60.0, 300.0, 600.0, 1800.0)
 DEFAULT_PROBE_ATTEMPTS = 1
 DEFAULT_PROBE_TIMEOUT_SECONDS = 5.0
 DEFAULT_PROBE_TOTAL_TIMEOUT_SECONDS = 10.0
@@ -55,6 +54,7 @@ RUMPS_INSTALL_CMD = "python3 -m pip install --user rumps"
 
 RETRYABLE_LIVE_STATUS_CODES = {408, 409, 425, 429, 500, 502, 503, 504}
 HTTP_STATUS_PATTERN = re.compile(r"HTTP\s+(\d{3})")
+T = TypeVar("T")
 
 
 class ConfigError(Exception):
@@ -99,6 +99,15 @@ RUNTIME_ORDER: list[str] = []
 ACTIVE_PROVIDER_NAME: str | None = None
 LAST_PROBE_ERROR: str | None = None
 LAST_PROBE_TIME_UNIX: float | None = None
+PROBER_WAKE_EVENT = threading.Event()
+PROBE_EXECUTION_LOCK = threading.Lock()
+PROBE_IN_PROGRESS = False
+PROBE_REQUEST_PENDING = False
+PROBE_ASYNC_RUNTIME_LOCK = threading.Lock()
+PROBE_ASYNC_READY = threading.Event()
+PROBE_ASYNC_LOOP: asyncio.AbstractEventLoop | None = None
+PROBE_ASYNC_LOOP_THREAD: threading.Thread | None = None
+PROBE_HTTP_CLIENT: httpx.AsyncClient | None = None
 
 PROBE_INTERVAL_SECONDS = DEFAULT_PROBE_INTERVAL_SECONDS
 PROBE_ATTEMPTS = DEFAULT_PROBE_ATTEMPTS
@@ -303,9 +312,9 @@ def default_generate_probe_body() -> dict[str, Any]:
     }
 
 
-def probe_once(
-    provider: Provider, timeout_s: float, insecure: bool, ca_file: str | None
-) -> tuple[bool, float | None, str | None]:
+def _build_probe_request(
+    provider: Provider,
+) -> tuple[str, dict[str, str], bytes | None]:
     url = build_probe_url(provider)
     headers: dict[str, str] = {
         "User-Agent": "ai-auto-switch/1.0",
@@ -325,37 +334,93 @@ def probe_once(
             request_body = json.dumps(body, ensure_ascii=True).encode("utf-8")
             headers["Content-Type"] = "application/json"
 
-    req = urllib.request.Request(
-        url=url, data=request_body, method=provider.test_method, headers=headers
+    return url, headers, request_body
+
+
+def _probe_client_verify_config() -> bool | str:
+    if PROBE_INSECURE:
+        return False
+    if PROBE_CA_FILE:
+        return PROBE_CA_FILE
+    return True
+
+
+def _probe_client_limits() -> httpx.Limits:
+    connection_count = max(1, len(RUNTIME_ORDER))
+    return httpx.Limits(
+        max_connections=connection_count,
+        max_keepalive_connections=connection_count,
     )
-    ssl_context: ssl.SSLContext | None = None
-    if insecure:
-        ssl_context = ssl.create_default_context()
-        ssl_context.check_hostname = False
-        ssl_context.verify_mode = ssl.CERT_NONE
-    elif ca_file:
-        ssl_context = ssl.create_default_context(cafile=ca_file)
+
+
+def start_probe_async_runtime() -> None:
+    global PROBE_ASYNC_LOOP_THREAD
+
+    with PROBE_ASYNC_RUNTIME_LOCK:
+        if PROBE_ASYNC_LOOP_THREAD and PROBE_ASYNC_LOOP_THREAD.is_alive():
+            return
+        PROBE_ASYNC_READY.clear()
+        PROBE_ASYNC_LOOP_THREAD = threading.Thread(target=_probe_async_loop_main, daemon=True)
+        PROBE_ASYNC_LOOP_THREAD.start()
+
+    if not PROBE_ASYNC_READY.wait(timeout=5.0):
+        raise RuntimeError("Timed out starting async probe runtime.")
+
+
+def _probe_async_loop_main() -> None:
+    global PROBE_ASYNC_LOOP
+
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    PROBE_ASYNC_LOOP = loop
+    PROBE_ASYNC_READY.set()
+    loop.run_forever()
+
+
+def _submit_probe_coro(coroutine: Coroutine[Any, Any, T]) -> T:
+    start_probe_async_runtime()
+    if PROBE_ASYNC_LOOP is None:
+        raise RuntimeError("Async probe runtime is not available.")
+    future = asyncio.run_coroutine_threadsafe(coroutine, PROBE_ASYNC_LOOP)
+    return future.result()
+
+
+async def _get_probe_http_client() -> httpx.AsyncClient:
+    global PROBE_HTTP_CLIENT
+    if PROBE_HTTP_CLIENT is None:
+        PROBE_HTTP_CLIENT = httpx.AsyncClient(
+            verify=_probe_client_verify_config(),
+            limits=_probe_client_limits(),
+            follow_redirects=True,
+        )
+    return PROBE_HTTP_CLIENT
+
+
+async def probe_once_async(provider: Provider) -> tuple[bool, float | None, str | None]:
+    url, headers, request_body = _build_probe_request(provider)
+    client = await _get_probe_http_client()
 
     start = time.perf_counter()
     try:
-        with urllib.request.urlopen(req, timeout=timeout_s, context=ssl_context) as resp:
-            _ = resp.read(64)
-            status = getattr(resp, "status", 200)
-            elapsed_ms = (time.perf_counter() - start) * 1000.0
-            if 200 <= status < 300:
-                return True, elapsed_ms, None
-            return False, elapsed_ms, f"HTTP {status}"
-    except urllib.error.HTTPError as err:
+        response = await client.request(
+            method=provider.test_method,
+            url=url,
+            headers=headers,
+            content=request_body,
+            timeout=PROBE_TIMEOUT_SECONDS,
+        )
         elapsed_ms = (time.perf_counter() - start) * 1000.0
-        body = err.read(120).decode("utf-8", errors="ignore").strip()
+        if 200 <= response.status_code < 300:
+            return True, elapsed_ms, None
+        body = response.text[:120].strip()
         extra = f": {body}" if body else ""
-        return False, elapsed_ms, f"HTTP {err.code}{extra}"
-    except urllib.error.URLError as err:
-        elapsed_ms = (time.perf_counter() - start) * 1000.0
-        return False, elapsed_ms, f"URL error: {err.reason}"
-    except TimeoutError:
+        return False, elapsed_ms, f"HTTP {response.status_code}{extra}"
+    except httpx.TimeoutException:
         elapsed_ms = (time.perf_counter() - start) * 1000.0
         return False, elapsed_ms, "Timeout"
+    except httpx.HTTPError as err:
+        elapsed_ms = (time.perf_counter() - start) * 1000.0
+        return False, elapsed_ms, f"{type(err).__name__}: {err}"
     except Exception as err:  # pragma: no cover
         elapsed_ms = (time.perf_counter() - start) * 1000.0
         return False, elapsed_ms, f"{type(err).__name__}: {err}"
@@ -387,6 +452,47 @@ def print_rumps_install_hint() -> None:
 def _log(message: str) -> None:
     ts = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S%z")
     print(f"[{ts}] {message}", flush=True)
+
+
+def _format_probe_interval(seconds: float) -> str:
+    if seconds >= 60 and float(seconds).is_integer() and int(seconds) % 60 == 0:
+        minutes = int(seconds) // 60
+        if minutes % 60 == 0:
+            hours = minutes // 60
+            return f"{hours}h"
+        return f"{minutes}m"
+    if float(seconds).is_integer():
+        return f"{int(seconds)}s"
+    return f"{seconds:g}s"
+
+
+def set_probe_interval(seconds: float) -> None:
+    global PROBE_INTERVAL_SECONDS
+    with RUNTIME_LOCK:
+        PROBE_INTERVAL_SECONDS = seconds
+    _log(f"[probe] interval set to {_format_probe_interval(seconds)} ({seconds:g}s)")
+    PROBER_WAKE_EVENT.set()
+
+
+def start_probe_async(reason: str = "manual") -> bool:
+    global PROBE_REQUEST_PENDING
+    with RUNTIME_LOCK:
+        if PROBE_IN_PROGRESS or PROBE_REQUEST_PENDING:
+            return False
+        PROBE_REQUEST_PENDING = True
+
+    threading.Thread(target=_probe_async_worker, args=(reason,), daemon=True).start()
+    return True
+
+
+def _probe_async_worker(reason: str) -> None:
+    global PROBE_REQUEST_PENDING
+    try:
+        run_probe_once(reason)
+    finally:
+        with RUNTIME_LOCK:
+            if PROBE_REQUEST_PENDING and not PROBE_IN_PROGRESS:
+                PROBE_REQUEST_PENDING = False
 
 
 def _compact_error(error: str | None, limit: int = 160) -> str | None:
@@ -917,16 +1023,11 @@ def _log_probe_cycle(result_by_name: dict[str, tuple[bool, float | None, str | N
             _log(line)
 
 
-def _probe_provider_cycle(provider: Provider) -> tuple[bool, float | None, str | None]:
+async def _probe_provider_cycle(provider: Provider) -> tuple[bool, float | None, str | None]:
     last_latency: float | None = None
     last_error: str | None = None
     for _ in range(PROBE_ATTEMPTS):
-        ok, latency_ms, error = probe_once(
-            provider,
-            timeout_s=PROBE_TIMEOUT_SECONDS,
-            insecure=PROBE_INSECURE,
-            ca_file=PROBE_CA_FILE,
-        )
+        ok, latency_ms, error = await probe_once_async(provider)
         last_latency = latency_ms
         last_error = error
         if ok:
@@ -934,7 +1035,7 @@ def _probe_provider_cycle(provider: Provider) -> tuple[bool, float | None, str |
     return False, last_latency, last_error or "Probe failed"
 
 
-def _probe_provider_batch(
+async def _probe_provider_batch(
     names: list[str],
     provider_by_name: dict[str, Provider],
     deadline: float,
@@ -943,34 +1044,51 @@ def _probe_provider_batch(
     if not names:
         return result_by_name
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, len(names))) as executor:
-        futures: dict[concurrent.futures.Future[tuple[bool, float | None, str | None]], str] = {}
-        for name in names:
-            futures[executor.submit(_probe_provider_cycle, provider_by_name[name])] = name
+    tasks: dict[asyncio.Task[tuple[bool, float | None, str | None]], str] = {}
+    for name in names:
+        tasks[asyncio.create_task(_probe_provider_cycle(provider_by_name[name]))] = name
 
-        remaining = max(0.0, deadline - time.monotonic())
-        done, not_done = concurrent.futures.wait(futures.keys(), timeout=remaining)
+    remaining = max(0.0, deadline - time.monotonic())
+    done, not_done = await asyncio.wait(tasks.keys(), timeout=remaining)
 
-        for future in done:
-            name = futures[future]
-            try:
-                result_by_name[name] = future.result()
-            except Exception as err:
-                result_by_name[name] = (
-                    False,
-                    None,
-                    f"Probe exception: {type(err).__name__}: {err}",
-                )
+    for task in done:
+        name = tasks[task]
+        try:
+            result_by_name[name] = task.result()
+        except Exception as err:
+            result_by_name[name] = (
+                False,
+                None,
+                f"Probe exception: {type(err).__name__}: {err}",
+            )
 
-        for future in not_done:
-            name = futures[future]
-            future.cancel()
-            result_by_name[name] = (False, None, "Probe total timeout exceeded")
+    for task in not_done:
+        name = tasks[task]
+        task.cancel()
+        result_by_name[name] = (False, None, "Probe total timeout exceeded")
+
+    if not_done:
+        await asyncio.gather(*not_done, return_exceptions=True)
 
     return result_by_name
 
 
-def run_probe_once() -> Provider | None:
+def run_probe_once(reason: str = "probe") -> Provider | None:
+    global PROBE_IN_PROGRESS
+    global PROBE_REQUEST_PENDING
+
+    with PROBE_EXECUTION_LOCK:
+        with RUNTIME_LOCK:
+            PROBE_REQUEST_PENDING = False
+            PROBE_IN_PROGRESS = True
+        try:
+            return _submit_probe_coro(_run_probe_once_impl())
+        finally:
+            with RUNTIME_LOCK:
+                PROBE_IN_PROGRESS = False
+
+
+async def _run_probe_once_impl() -> Provider | None:
     global ACTIVE_PROVIDER_NAME
     global LAST_PROBE_ERROR
     global LAST_PROBE_TIME_UNIX
@@ -994,7 +1112,7 @@ def run_probe_once() -> Provider | None:
     result_by_name: dict[str, tuple[bool, float | None, str | None]] = {}
     stage_reason = "cheap_probe"
 
-    cheap_results = _probe_provider_batch(cheap_names, provider_by_name, deadline)
+    cheap_results = await _probe_provider_batch(cheap_names, provider_by_name, deadline)
     result_by_name.update(cheap_results)
     cheap_success_names = {name for name, (ok, _, _) in cheap_results.items() if ok}
 
@@ -1004,7 +1122,7 @@ def run_probe_once() -> Provider | None:
 
     if run_expensive_fallback:
         stage_reason = "expensive_fallback"
-        expensive_results = _probe_provider_batch(expensive_names, provider_by_name, deadline)
+        expensive_results = await _probe_provider_batch(expensive_names, provider_by_name, deadline)
         result_by_name.update(expensive_results)
         expensive_success_names = {
             name for name, (ok, _, _) in expensive_results.items() if ok
@@ -1102,13 +1220,16 @@ def run_probe_once() -> Provider | None:
 def prober_loop() -> None:
     while True:
         try:
-            run_probe_once()
+            run_probe_once("background")
         except Exception as err:  # pragma: no cover
             global LAST_PROBE_ERROR
             with RUNTIME_LOCK:
                 LAST_PROBE_ERROR = f"Probe exception: {type(err).__name__}: {err}"
             _log(f"[probe] exception: {err}")
-        time.sleep(PROBE_INTERVAL_SECONDS)
+        with RUNTIME_LOCK:
+            wait_seconds = PROBE_INTERVAL_SECONDS
+        PROBER_WAKE_EVENT.wait(wait_seconds)
+        PROBER_WAKE_EVENT.clear()
 
 
 def _sanitize_response_headers(headers: httpx.Headers) -> dict[str, str]:
@@ -1386,6 +1507,8 @@ def run_optional_menubar() -> bool:
                 tuple[str, bool, float | None, float | None, float | None, float]
             ],
             active_name: str | None,
+            probe_interval_seconds: float,
+            is_probing: bool,
         ) -> None:
             provider_snapshots.sort(
                 key=lambda item: (
@@ -1395,7 +1518,22 @@ def run_optional_menubar() -> bool:
                 )
             )
 
-            menu_items: list[Any] = [rumps.MenuItem("Force Probe Now", callback=self.force_probe)]
+            if is_probing:
+                menu_items: list[Any] = [rumps.MenuItem("Probing...", callback=None)]
+            else:
+                menu_items = [rumps.MenuItem("Force Probe Now", callback=self.force_probe)]
+            probe_interval_item = rumps.MenuItem(
+                f"Probe Interval ({_format_probe_interval(probe_interval_seconds)})",
+                callback=None,
+            )
+            for seconds in PROBE_INTERVAL_PRESETS_SECONDS:
+                item = rumps.MenuItem(
+                    _format_probe_interval(seconds),
+                    callback=lambda _, seconds=seconds: self.set_probe_interval_from_menu(seconds),
+                )
+                item.state = 1 if abs(seconds - probe_interval_seconds) < 1e-9 else 0
+                probe_interval_item.add(item)
+            menu_items.append(probe_interval_item)
             for name, is_healthy, score, avg_latency_ms, last_probe_ts, input_price in provider_snapshots:
                 marker = "⭐" if name == active_name else "  "
                 display_name = f"{name} ({input_price:g})"
@@ -1428,6 +1566,8 @@ def run_optional_menubar() -> bool:
                 active = RUNTIME_BY_NAME.get(ACTIVE_PROVIDER_NAME) if ACTIVE_PROVIDER_NAME else None
                 error = LAST_PROBE_ERROR
                 active_name = ACTIVE_PROVIDER_NAME
+                probe_interval_seconds = PROBE_INTERVAL_SECONDS
+                is_probing = PROBE_IN_PROGRESS or PROBE_REQUEST_PENDING
                 provider_snapshots = [
                     (
                         name,
@@ -1440,7 +1580,12 @@ def run_optional_menubar() -> bool:
                     for name in RUNTIME_ORDER
                 ]
 
-            self._build_menu(provider_snapshots, active_name)
+            self._build_menu(
+                provider_snapshots,
+                active_name,
+                probe_interval_seconds,
+                is_probing,
+            )
 
             if active:
                 if active.moving_avg_latency_ms is not None:
@@ -1453,7 +1598,11 @@ def run_optional_menubar() -> bool:
                 self.title = "🤖 Init"
 
         def force_probe(self, _):
-            run_probe_once()
+            start_probe_async("manual")
+            self._refresh_title()
+
+        def set_probe_interval_from_menu(self, seconds: float):
+            set_probe_interval(seconds)
             self._refresh_title()
 
         def quit_app(self, _):
@@ -1567,7 +1716,13 @@ def main() -> int:
         PROXY_PUBLIC_BASE_URL = None
         LAST_WRITTEN_ENV = None
 
-    run_probe_once()
+    try:
+        start_probe_async_runtime()
+    except Exception as err:
+        _log(f"Failed to start async probe runtime: {err}")
+        return 2
+
+    run_probe_once("startup")
     threading.Thread(target=prober_loop, daemon=True).start()
 
     if menubar_enabled:
