@@ -40,15 +40,34 @@ cp providers.example.json providers.json
       "base_url": "https://yunwu.ai",
       "api_key_env": "YUNWU_MAIN_API_KEY",
       "model": "gemini-3-flash-preview",
-      "session_model": "gemini-3-pro-preview"
+      "session_model": "gemini-3-pro-preview",
+      "cheap_only": true,
+      "expensive_only": false,
+      "use_query_key": true,
+      "use_header_key": true,
+      "header_key_name": "x-goog-api-key",
+      "headers": {
+        "x-provider-group": "gemini-cli"
+      }
     },
     {
       "name": "relay-backup",
       "input_price": 3.8,
-      "base_url": "https://another-relay.example",
+      "base_url": "https://example-relay.ai",
       "api_key": "your-direct-key-here",
       "model": "gemini-3-flash-preview",
-      "session_model": "gemini-3-pro-preview"
+      "session_model": "gemini-3-pro-preview",
+      "cheap_only": false,
+      "expensive_only": true,
+      "test_path": "/health",
+      "test_method": "GET",
+      "use_query_key": false,
+      "use_header_key": true,
+      "header_key_name": "Authorization",
+      "headers": {
+        "Authorization": "Bearer your-direct-key-here",
+        "x-relay-route": "backup"
+      }
     }
   ]
 }
@@ -56,6 +75,7 @@ cp providers.example.json providers.json
 
 建议优先使用 `api_key_env`，而不是明文 `api_key`。
 对于 `proxy_app.py` 的评分路由逻辑，每个提供方都必须配置 `input_price`。
+`cheap_only` 和 `expensive_only` 不能同时为 `true`。
 
 ## proxy_app.py（本地代理）
 
@@ -152,20 +172,25 @@ python3 proxy_app.py --headless
 curl -sS http://127.0.0.1:18080/_health
 ```
 
-## 可选的提供方字段
+## 提供方字段
 
-- `input_price`（`proxy_app.py` 评分必须项）
-- `test_path`（可选，覆盖默认的模型探测路径）
-- `test_method`（可选；模型探测默认 `POST`，设置了 `test_path` 时默认 `GET`）
-- `test_body`（可选；为 `POST`/`PUT`/`PATCH` 提供自定义请求体）
-- `model`（探测模型，默认：`gemini-3-flash-preview`）
-- `session_model`（导出到运行环境中的模型，默认：`gemini-3-pro-preview`）
+- `name`（必填，提供方名称）
+- `base_url`（必填，提供方基础地址）
+- `input_price`（必填，`proxy_app.py` 评分使用）
+- `api_key`（与 `api_key_env` 二选一）
+- `api_key_env`（与 `api_key` 二选一；从环境变量读取密钥）
+- `model`（可选，探测模型，默认：`gemini-3-flash-preview`）
+- `session_model`（可选，导出到运行环境中的模型，默认：`gemini-3-pro-preview`）
 - `cheap_only`（可选布尔值；从昂贵回退阶段中排除）
 - `expensive_only`（可选布尔值；从便宜阶段中排除，仅在回退时使用）
-- `use_query_key`（默认：`true`）
-- `use_header_key`（默认：`true`）
-- `header_key_name`（默认：`x-goog-api-key`）
-- `headers`（额外请求头对象）
+- `cheap_only` 与 `expensive_only` 不能同时为 `true`
+- `test_path`（可选，覆盖默认的模型探测路径）
+- `test_method`（可选；若未设置，存在 `test_path` 时默认 `GET`，否则默认 `POST`）
+- `test_body`（可选；仅用于 `POST`/`PUT`/`PATCH`）
+- `use_query_key`（可选，默认：`true`）
+- `use_header_key`（可选，默认：`true`）
+- `header_key_name`（可选，默认：`x-goog-api-key`）
+- `headers`（可选，额外请求头对象）
 
 ## 说明
 

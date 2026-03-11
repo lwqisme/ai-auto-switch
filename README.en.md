@@ -42,15 +42,34 @@ Then fill your providers in `providers.json`:
       "base_url": "https://yunwu.ai",
       "api_key_env": "YUNWU_MAIN_API_KEY",
       "model": "gemini-3-flash-preview",
-      "session_model": "gemini-3-pro-preview"
+      "session_model": "gemini-3-pro-preview",
+      "cheap_only": true,
+      "expensive_only": false,
+      "use_query_key": true,
+      "use_header_key": true,
+      "header_key_name": "x-goog-api-key",
+      "headers": {
+        "x-provider-group": "gemini-cli"
+      }
     },
     {
       "name": "relay-backup",
       "input_price": 3.8,
-      "base_url": "https://another-relay.example",
+      "base_url": "https://example-relay.ai",
       "api_key": "your-direct-key-here",
       "model": "gemini-3-flash-preview",
-      "session_model": "gemini-3-pro-preview"
+      "session_model": "gemini-3-pro-preview",
+      "cheap_only": false,
+      "expensive_only": true,
+      "test_path": "/health",
+      "test_method": "GET",
+      "use_query_key": false,
+      "use_header_key": true,
+      "header_key_name": "Authorization",
+      "headers": {
+        "Authorization": "Bearer your-direct-key-here",
+        "x-relay-route": "backup"
+      }
     }
   ]
 }
@@ -58,6 +77,7 @@ Then fill your providers in `providers.json`:
 
 Recommended: use `api_key_env` instead of plain `api_key`.
 For `proxy_app.py` score-based routing, each provider must include `input_price`.
+`cheap_only` and `expensive_only` cannot both be `true`.
 
 ## proxy_app.py (local proxy)
 
@@ -156,20 +176,25 @@ Health check:
 curl -sS http://127.0.0.1:18080/_health
 ```
 
-## Optional per-provider fields
+## Provider Fields
 
+- `name` (required provider name)
+- `base_url` (required provider base URL)
 - `input_price` (required for `proxy_app.py` scoring)
-- `test_path` (optional, overrides model-based probe URL)
-- `test_method` (optional, default: `POST` for model probe, `GET` when `test_path` is set)
-- `test_body` (optional custom body for POST/PUT/PATCH probe methods)
-- `model` (probe model, default: `gemini-3-flash-preview`)
-- `session_model` (exported runtime model, default: `gemini-3-pro-preview`)
+- `api_key` (one of `api_key` / `api_key_env` is required)
+- `api_key_env` (one of `api_key` / `api_key_env` is required; reads the key from an env var)
+- `model` (optional probe model, default: `gemini-3-flash-preview`)
+- `session_model` (optional exported runtime model, default: `gemini-3-pro-preview`)
 - `cheap_only` (optional bool; excludes provider from expensive fallback stage)
 - `expensive_only` (optional bool; excludes provider from cheap stage, used only in fallback)
-- `use_query_key` (default: `true`)
-- `use_header_key` (default: `true`)
-- `header_key_name` (default: `x-goog-api-key`)
-- `headers` (extra request headers object)
+- `cheap_only` and `expensive_only` cannot both be `true`
+- `test_path` (optional, overrides model-based probe URL)
+- `test_method` (optional; defaults to `GET` when `test_path` is set, otherwise `POST`)
+- `test_body` (optional custom body for `POST`/`PUT`/`PATCH`)
+- `use_query_key` (optional, default: `true`)
+- `use_header_key` (optional, default: `true`)
+- `header_key_name` (optional, default: `x-goog-api-key`)
+- `headers` (optional extra request headers object)
 
 ## Notes
 

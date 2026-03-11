@@ -8,17 +8,63 @@
       "model": "gemini-3-flash-preview",
       "session_model": "gemini-3-pro-preview",
       "cheap_only": true,
-      "expensive_only": false
+      "expensive_only": false,
+      "use_query_key": true,
+      "use_header_key": true,
+      "header_key_name": "x-goog-api-key",
+      "headers": {
+        "x-provider-group": "gemini-cli"
+      }
     },
     {
       "name": "relay-backup",
       "input_price": 3.8,
       "base_url": "https://example-relay.ai",
-      "api_key_env": "RELAY_BACKUP_API_KEY",
+      "api_key": "your-direct-key-here",
       "model": "gemini-3-flash-preview",
       "session_model": "gemini-3-pro-preview",
       "cheap_only": false,
-      "expensive_only": true
+      "expensive_only": true,
+      "test_path": "/health",
+      "test_method": "GET",
+      "use_query_key": false,
+      "use_header_key": true,
+      "header_key_name": "Authorization",
+      "headers": {
+        "Authorization": "Bearer your-direct-key-here",
+        "x-relay-route": "backup"
+      }
+    },
+    {
+      "name": "custom-probe-provider",
+      "input_price": 2.4,
+      "base_url": "https://custom-probe.example",
+      "api_key_env": "CUSTOM_PROBE_API_KEY",
+      "model": "gemini-3-flash-preview",
+      "session_model": "gemini-3-pro-preview",
+      "cheap_only": false,
+      "expensive_only": false,
+      "test_path": "/v1/ping",
+      "test_method": "POST",
+      "test_body": {
+        "contents": [
+          {
+            "parts": [
+              {
+                "text": "ping"
+              }
+            ]
+          }
+        ],
+        "generationConfig": {
+          "maxOutputTokens": 1
+        }
+      },
+      "use_query_key": true,
+      "use_header_key": false,
+      "headers": {
+        "x-custom-header": "demo"
+      }
     }
   ]
 }
