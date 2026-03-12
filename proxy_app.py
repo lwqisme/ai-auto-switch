@@ -40,7 +40,7 @@ SAFE_ENV_VALUE = re.compile(r"^[A-Za-z0-9._:/@%+=-]+$")
 DEFAULT_PROXY_HOST = "127.0.0.1"
 DEFAULT_PROXY_PORT = 18080
 DEFAULT_PROBE_INTERVAL_SECONDS = 60.0
-PROBE_INTERVAL_PRESETS_SECONDS = (60.0, 300.0, 600.0, 1800.0)
+PROBE_INTERVAL_PRESETS_SECONDS = (0.0, 60.0, 300.0, 600.0, 1800.0)
 DEFAULT_PROBE_ATTEMPTS = 1
 DEFAULT_PROBE_TIMEOUT_SECONDS = 5.0
 DEFAULT_PROBE_TOTAL_TIMEOUT_SECONDS = 10.0
@@ -107,8 +107,6 @@ PROBE_ASYNC_RUNTIME_LOCK = threading.Lock()
 PROBE_ASYNC_READY = threading.Event()
 PROBE_ASYNC_LOOP: asyncio.AbstractEventLoop | None = None
 PROBE_ASYNC_LOOP_THREAD: threading.Thread | None = None
-PROBE_HTTP_CLIENT: httpx.AsyncClient | None = None
-
 PROBE_INTERVAL_SECONDS = DEFAULT_PROBE_INTERVAL_SECONDS
 PROBE_ATTEMPTS = DEFAULT_PROBE_ATTEMPTS
 PROBE_TIMEOUT_SECONDS = DEFAULT_PROBE_TIMEOUT_SECONDS
@@ -385,20 +383,18 @@ def _submit_probe_coro(coroutine: Coroutine[Any, Any, T]) -> T:
     return future.result()
 
 
-async def _get_probe_http_client() -> httpx.AsyncClient:
-    global PROBE_HTTP_CLIENT
-    if PROBE_HTTP_CLIENT is None:
-        PROBE_HTTP_CLIENT = httpx.AsyncClient(
-            verify=_probe_client_verify_config(),
-            limits=_probe_client_limits(),
-            follow_redirects=True,
-        )
-    return PROBE_HTTP_CLIENT
+def _build_probe_http_client() -> httpx.AsyncClient:
+    return httpx.AsyncClient(
+        verify=_probe_client_verify_config(),
+        limits=_probe_client_limits(),
+        follow_redirects=True,
+    )
 
 
-async def probe_once_async(provider: Provider) -> tuple[bool, float | None, str | None]:
+async def probe_once_async(
+    provider: Provider, client: httpx.AsyncClient
+) -> tuple[bool, float | None, str | None]:
     url, headers, request_body = _build_probe_request(provider)
-    client = await _get_probe_http_client()
 
     start = time.perf_counter()
     try:
@@ -455,6 +451,8 @@ def _log(message: str) -> None:
 
 
 def _format_probe_interval(seconds: float) -> str:
+    if seconds <= 0:
+        return "never"
     if seconds >= 60 and float(seconds).is_integer() and int(seconds) % 60 == 0:
         minutes = int(seconds) // 60
         if minutes % 60 == 0:
@@ -470,7 +468,10 @@ def set_probe_interval(seconds: float) -> None:
     global PROBE_INTERVAL_SECONDS
     with RUNTIME_LOCK:
         PROBE_INTERVAL_SECONDS = seconds
-    _log(f"[probe] interval set to {_format_probe_interval(seconds)} ({seconds:g}s)")
+    if seconds <= 0:
+        _log("[probe] interval set to never (background probing disabled)")
+    else:
+        _log(f"[probe] interval set to {_format_probe_interval(seconds)} ({seconds:g}s)")
     PROBER_WAKE_EVENT.set()
 
 
@@ -635,7 +636,10 @@ def parse_args() -> argparse.Namespace:
         "--probe-interval",
         type=float,
         default=DEFAULT_PROBE_INTERVAL_SECONDS,
-        help=f"Seconds between background probes (default: {DEFAULT_PROBE_INTERVAL_SECONDS}).",
+        help=(
+            "Seconds between background probes "
+            f"(default: {DEFAULT_PROBE_INTERVAL_SECONDS}; use 0 to disable)."
+        ),
     )
     parser.add_argument(
         "--probe-attempts",
@@ -1023,11 +1027,13 @@ def _log_probe_cycle(result_by_name: dict[str, tuple[bool, float | None, str | N
             _log(line)
 
 
-async def _probe_provider_cycle(provider: Provider) -> tuple[bool, float | None, str | None]:
+async def _probe_provider_cycle(
+    provider: Provider, client: httpx.AsyncClient
+) -> tuple[bool, float | None, str | None]:
     last_latency: float | None = None
     last_error: str | None = None
     for _ in range(PROBE_ATTEMPTS):
-        ok, latency_ms, error = await probe_once_async(provider)
+        ok, latency_ms, error = await probe_once_async(provider, client)
         last_latency = latency_ms
         last_error = error
         if ok:
@@ -1039,6 +1045,7 @@ async def _probe_provider_batch(
     names: list[str],
     provider_by_name: dict[str, Provider],
     deadline: float,
+    client: httpx.AsyncClient,
 ) -> dict[str, tuple[bool, float | None, str | None]]:
     result_by_name: dict[str, tuple[bool, float | None, str | None]] = {}
     if not names:
@@ -1046,7 +1053,7 @@ async def _probe_provider_batch(
 
     tasks: dict[asyncio.Task[tuple[bool, float | None, str | None]], str] = {}
     for name in names:
-        tasks[asyncio.create_task(_probe_provider_cycle(provider_by_name[name]))] = name
+        tasks[asyncio.create_task(_probe_provider_cycle(provider_by_name[name], client))] = name
 
     remaining = max(0.0, deadline - time.monotonic())
     done, not_done = await asyncio.wait(tasks.keys(), timeout=remaining)
@@ -1112,28 +1119,31 @@ async def _run_probe_once_impl() -> Provider | None:
     result_by_name: dict[str, tuple[bool, float | None, str | None]] = {}
     stage_reason = "cheap_probe"
 
-    cheap_results = await _probe_provider_batch(cheap_names, provider_by_name, deadline)
-    result_by_name.update(cheap_results)
-    cheap_success_names = {name for name, (ok, _, _) in cheap_results.items() if ok}
+    async with _build_probe_http_client() as client:
+        cheap_results = await _probe_provider_batch(cheap_names, provider_by_name, deadline, client)
+        result_by_name.update(cheap_results)
+        cheap_success_names = {name for name, (ok, _, _) in cheap_results.items() if ok}
 
-    run_expensive_fallback = not cheap_success_names and bool(expensive_names)
-    expensive_results: dict[str, tuple[bool, float | None, str | None]] = {}
-    expensive_success_names: set[str] = set()
+        run_expensive_fallback = not cheap_success_names and bool(expensive_names)
+        expensive_results: dict[str, tuple[bool, float | None, str | None]] = {}
+        expensive_success_names: set[str] = set()
 
-    if run_expensive_fallback:
-        stage_reason = "expensive_fallback"
-        expensive_results = await _probe_provider_batch(expensive_names, provider_by_name, deadline)
-        result_by_name.update(expensive_results)
-        expensive_success_names = {
-            name for name, (ok, _, _) in expensive_results.items() if ok
-        }
-    else:
-        for name in expensive_names:
-            result_by_name[name] = (
-                False,
-                None,
-                "Skipped: cheap providers healthy",
+        if run_expensive_fallback:
+            stage_reason = "expensive_fallback"
+            expensive_results = await _probe_provider_batch(
+                expensive_names, provider_by_name, deadline, client
             )
+            result_by_name.update(expensive_results)
+            expensive_success_names = {
+                name for name, (ok, _, _) in expensive_results.items() if ok
+            }
+        else:
+            for name in expensive_names:
+                result_by_name[name] = (
+                    False,
+                    None,
+                    "Skipped: cheap providers healthy",
+                )
 
     force_unhealthy_cheap = bool(cheap_names) and not cheap_success_names
     force_unhealthy_expensive = (
@@ -1219,6 +1229,16 @@ async def _run_probe_once_impl() -> Provider | None:
 
 def prober_loop() -> None:
     while True:
+        with RUNTIME_LOCK:
+            wait_seconds = PROBE_INTERVAL_SECONDS
+        if wait_seconds <= 0:
+            PROBER_WAKE_EVENT.wait()
+            PROBER_WAKE_EVENT.clear()
+            continue
+        woke_early = PROBER_WAKE_EVENT.wait(wait_seconds)
+        PROBER_WAKE_EVENT.clear()
+        if woke_early:
+            continue
         try:
             run_probe_once("background")
         except Exception as err:  # pragma: no cover
@@ -1226,10 +1246,6 @@ def prober_loop() -> None:
             with RUNTIME_LOCK:
                 LAST_PROBE_ERROR = f"Probe exception: {type(err).__name__}: {err}"
             _log(f"[probe] exception: {err}")
-        with RUNTIME_LOCK:
-            wait_seconds = PROBE_INTERVAL_SECONDS
-        PROBER_WAKE_EVENT.wait(wait_seconds)
-        PROBER_WAKE_EVENT.clear()
 
 
 def _sanitize_response_headers(headers: httpx.Headers) -> dict[str, str]:
@@ -1644,8 +1660,8 @@ def main() -> int:
         return launch_background_process(args)
 
     menubar_enabled = not args.headless
-    if args.probe_interval <= 0:
-        _log("--probe-interval must be > 0")
+    if args.probe_interval < 0:
+        _log("--probe-interval must be >= 0")
         return 2
     if args.probe_attempts <= 0:
         _log("--probe-attempts must be > 0")
