@@ -391,35 +391,34 @@ def _build_probe_http_client() -> httpx.AsyncClient:
     )
 
 
-async def probe_once_async(
-    provider: Provider, client: httpx.AsyncClient
-) -> tuple[bool, float | None, str | None]:
+async def probe_once_async(provider: Provider) -> tuple[bool, float | None, str | None]:
     url, headers, request_body = _build_probe_request(provider)
 
     start = time.perf_counter()
-    try:
-        response = await client.request(
-            method=provider.test_method,
-            url=url,
-            headers=headers,
-            content=request_body,
-            timeout=PROBE_TIMEOUT_SECONDS,
-        )
-        elapsed_ms = (time.perf_counter() - start) * 1000.0
-        if 200 <= response.status_code < 300:
-            return True, elapsed_ms, None
-        body = response.text[:120].strip()
-        extra = f": {body}" if body else ""
-        return False, elapsed_ms, f"HTTP {response.status_code}{extra}"
-    except httpx.TimeoutException:
-        elapsed_ms = (time.perf_counter() - start) * 1000.0
-        return False, elapsed_ms, "Timeout"
-    except httpx.HTTPError as err:
-        elapsed_ms = (time.perf_counter() - start) * 1000.0
-        return False, elapsed_ms, f"{type(err).__name__}: {err}"
-    except Exception as err:  # pragma: no cover
-        elapsed_ms = (time.perf_counter() - start) * 1000.0
-        return False, elapsed_ms, f"{type(err).__name__}: {err}"
+    async with _build_probe_http_client() as client:
+        try:
+            response = await client.request(
+                method=provider.test_method,
+                url=url,
+                headers=headers,
+                content=request_body,
+                timeout=PROBE_TIMEOUT_SECONDS,
+            )
+            elapsed_ms = (time.perf_counter() - start) * 1000.0
+            if 200 <= response.status_code < 300:
+                return True, elapsed_ms, None
+            body = response.text[:120].strip()
+            extra = f": {body}" if body else ""
+            return False, elapsed_ms, f"HTTP {response.status_code}{extra}"
+        except httpx.TimeoutException:
+            elapsed_ms = (time.perf_counter() - start) * 1000.0
+            return False, elapsed_ms, "Timeout"
+        except httpx.HTTPError as err:
+            elapsed_ms = (time.perf_counter() - start) * 1000.0
+            return False, elapsed_ms, f"{type(err).__name__}: {err}"
+        except Exception as err:  # pragma: no cover
+            elapsed_ms = (time.perf_counter() - start) * 1000.0
+            return False, elapsed_ms, f"{type(err).__name__}: {err}"
 
 
 def resolve_ca_file(user_ca_file: str | None) -> str | None:
@@ -1027,13 +1026,11 @@ def _log_probe_cycle(result_by_name: dict[str, tuple[bool, float | None, str | N
             _log(line)
 
 
-async def _probe_provider_cycle(
-    provider: Provider, client: httpx.AsyncClient
-) -> tuple[bool, float | None, str | None]:
+async def _probe_provider_cycle(provider: Provider) -> tuple[bool, float | None, str | None]:
     last_latency: float | None = None
     last_error: str | None = None
     for _ in range(PROBE_ATTEMPTS):
-        ok, latency_ms, error = await probe_once_async(provider, client)
+        ok, latency_ms, error = await probe_once_async(provider)
         last_latency = latency_ms
         last_error = error
         if ok:
@@ -1045,7 +1042,6 @@ async def _probe_provider_batch(
     names: list[str],
     provider_by_name: dict[str, Provider],
     deadline: float,
-    client: httpx.AsyncClient,
 ) -> dict[str, tuple[bool, float | None, str | None]]:
     result_by_name: dict[str, tuple[bool, float | None, str | None]] = {}
     if not names:
@@ -1053,7 +1049,7 @@ async def _probe_provider_batch(
 
     tasks: dict[asyncio.Task[tuple[bool, float | None, str | None]], str] = {}
     for name in names:
-        tasks[asyncio.create_task(_probe_provider_cycle(provider_by_name[name], client))] = name
+        tasks[asyncio.create_task(_probe_provider_cycle(provider_by_name[name]))] = name
 
     remaining = max(0.0, deadline - time.monotonic())
     done, not_done = await asyncio.wait(tasks.keys(), timeout=remaining)
@@ -1119,31 +1115,28 @@ async def _run_probe_once_impl() -> Provider | None:
     result_by_name: dict[str, tuple[bool, float | None, str | None]] = {}
     stage_reason = "cheap_probe"
 
-    async with _build_probe_http_client() as client:
-        cheap_results = await _probe_provider_batch(cheap_names, provider_by_name, deadline, client)
-        result_by_name.update(cheap_results)
-        cheap_success_names = {name for name, (ok, _, _) in cheap_results.items() if ok}
+    cheap_results = await _probe_provider_batch(cheap_names, provider_by_name, deadline)
+    result_by_name.update(cheap_results)
+    cheap_success_names = {name for name, (ok, _, _) in cheap_results.items() if ok}
 
-        run_expensive_fallback = not cheap_success_names and bool(expensive_names)
-        expensive_results: dict[str, tuple[bool, float | None, str | None]] = {}
-        expensive_success_names: set[str] = set()
+    run_expensive_fallback = not cheap_success_names and bool(expensive_names)
+    expensive_results: dict[str, tuple[bool, float | None, str | None]] = {}
+    expensive_success_names: set[str] = set()
 
-        if run_expensive_fallback:
-            stage_reason = "expensive_fallback"
-            expensive_results = await _probe_provider_batch(
-                expensive_names, provider_by_name, deadline, client
+    if run_expensive_fallback:
+        stage_reason = "expensive_fallback"
+        expensive_results = await _probe_provider_batch(expensive_names, provider_by_name, deadline)
+        result_by_name.update(expensive_results)
+        expensive_success_names = {
+            name for name, (ok, _, _) in expensive_results.items() if ok
+        }
+    else:
+        for name in expensive_names:
+            result_by_name[name] = (
+                False,
+                None,
+                "Skipped: cheap providers healthy",
             )
-            result_by_name.update(expensive_results)
-            expensive_success_names = {
-                name for name, (ok, _, _) in expensive_results.items() if ok
-            }
-        else:
-            for name in expensive_names:
-                result_by_name[name] = (
-                    False,
-                    None,
-                    "Skipped: cheap providers healthy",
-                )
 
     force_unhealthy_cheap = bool(cheap_names) and not cheap_success_names
     force_unhealthy_expensive = (
