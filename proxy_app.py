@@ -107,6 +107,7 @@ PROBE_ASYNC_RUNTIME_LOCK = threading.Lock()
 PROBE_ASYNC_READY = threading.Event()
 PROBE_ASYNC_LOOP: asyncio.AbstractEventLoop | None = None
 PROBE_ASYNC_LOOP_THREAD: threading.Thread | None = None
+PROBE_HTTP_CLIENT: httpx.AsyncClient | None = None
 PROBE_INTERVAL_SECONDS = DEFAULT_PROBE_INTERVAL_SECONDS
 PROBE_ATTEMPTS = DEFAULT_PROBE_ATTEMPTS
 PROBE_TIMEOUT_SECONDS = DEFAULT_PROBE_TIMEOUT_SECONDS
@@ -126,6 +127,7 @@ LAST_WRITTEN_ENV: dict[str, str] | None = None
 ENV_WRITE_LOCK = threading.Lock()
 
 app = FastAPI(title="AI Auto Switch Proxy")
+PROXY_HTTP_CLIENT: httpx.AsyncClient | None = None
 
 
 def mask_key(key: str) -> str:
@@ -366,11 +368,12 @@ def start_probe_async_runtime() -> None:
 
 
 def _probe_async_loop_main() -> None:
-    global PROBE_ASYNC_LOOP
+    global PROBE_ASYNC_LOOP, PROBE_HTTP_CLIENT
 
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     PROBE_ASYNC_LOOP = loop
+    PROBE_HTTP_CLIENT = _build_probe_http_client()
     PROBE_ASYNC_READY.set()
     loop.run_forever()
 
@@ -394,31 +397,34 @@ def _build_probe_http_client() -> httpx.AsyncClient:
 async def probe_once_async(provider: Provider) -> tuple[bool, float | None, str | None]:
     url, headers, request_body = _build_probe_request(provider)
 
+    client = PROBE_HTTP_CLIENT
+    if client is None:
+        return False, None, "Probe client not initialized"
+
     start = time.perf_counter()
-    async with _build_probe_http_client() as client:
-        try:
-            response = await client.request(
-                method=provider.test_method,
-                url=url,
-                headers=headers,
-                content=request_body,
-                timeout=PROBE_TIMEOUT_SECONDS,
-            )
-            elapsed_ms = (time.perf_counter() - start) * 1000.0
-            if 200 <= response.status_code < 300:
-                return True, elapsed_ms, None
-            body = response.text[:120].strip()
-            extra = f": {body}" if body else ""
-            return False, elapsed_ms, f"HTTP {response.status_code}{extra}"
-        except httpx.TimeoutException:
-            elapsed_ms = (time.perf_counter() - start) * 1000.0
-            return False, elapsed_ms, "Timeout"
-        except httpx.HTTPError as err:
-            elapsed_ms = (time.perf_counter() - start) * 1000.0
-            return False, elapsed_ms, f"{type(err).__name__}: {err}"
-        except Exception as err:  # pragma: no cover
-            elapsed_ms = (time.perf_counter() - start) * 1000.0
-            return False, elapsed_ms, f"{type(err).__name__}: {err}"
+    try:
+        response = await client.request(
+            method=provider.test_method,
+            url=url,
+            headers=headers,
+            content=request_body,
+            timeout=PROBE_TIMEOUT_SECONDS,
+        )
+        elapsed_ms = (time.perf_counter() - start) * 1000.0
+        if 200 <= response.status_code < 300:
+            return True, elapsed_ms, None
+        body = response.text[:120].strip()
+        extra = f": {body}" if body else ""
+        return False, elapsed_ms, f"HTTP {response.status_code}{extra}"
+    except httpx.TimeoutException:
+        elapsed_ms = (time.perf_counter() - start) * 1000.0
+        return False, elapsed_ms, "Timeout"
+    except httpx.HTTPError as err:
+        elapsed_ms = (time.perf_counter() - start) * 1000.0
+        return False, elapsed_ms, f"{type(err).__name__}: {err}"
+    except Exception as err:  # pragma: no cover
+        elapsed_ms = (time.perf_counter() - start) * 1000.0
+        return False, elapsed_ms, f"{type(err).__name__}: {err}"
 
 
 def resolve_ca_file(user_ca_file: str | None) -> str | None:
@@ -1249,14 +1255,13 @@ def _sanitize_response_headers(headers: httpx.Headers) -> dict[str, str]:
 
 
 async def _proxy_stream_generator(
-    client: httpx.AsyncClient, response: httpx.Response
+    response: httpx.Response,
 ):  # pragma: no cover
     try:
         async for chunk in response.aiter_raw():
             yield chunk
     finally:
         await response.aclose()
-        await client.aclose()
 
 
 def _build_health_payload() -> dict[str, Any]:
@@ -1372,7 +1377,7 @@ async def _send_request_to_provider(
     path: str,
     body: bytes,
     provider: Provider,
-) -> tuple[httpx.AsyncClient | None, httpx.Response | None, str | None]:
+) -> tuple[httpx.Response | None, str | None]:
     base = provider.base_url.rstrip("/")
     target_url = f"{base}/{path.lstrip('/')}"
 
@@ -1389,7 +1394,9 @@ async def _send_request_to_provider(
     if provider.headers:
         headers.update(provider.headers)
 
-    client = httpx.AsyncClient(timeout=120.0)
+    client = PROXY_HTTP_CLIENT
+    if client is None:
+        return None, "Proxy client not initialized"
     try:
         req = client.build_request(
             method=request.method,
@@ -1399,10 +1406,9 @@ async def _send_request_to_provider(
             content=body,
         )
         response = await client.send(req, stream=True)
-        return client, response, None
+        return response, None
     except Exception as err:
-        await client.aclose()
-        return None, None, f"{type(err).__name__}: {err}"
+        return None, f"{type(err).__name__}: {err}"
 
 
 @app.get("/_health")
@@ -1437,7 +1443,7 @@ async def proxy_handler(request: Request, path: str):
             )
 
         attempts += 1
-        client, response, send_error = await _send_request_to_provider(
+        response, send_error = await _send_request_to_provider(
             request=request,
             path=path,
             body=body,
@@ -1457,7 +1463,6 @@ async def proxy_handler(request: Request, path: str):
                 break
             continue
 
-        assert client is not None
         assert response is not None
 
         if _is_retryable_live_status(response.status_code):
@@ -1468,7 +1473,6 @@ async def proxy_handler(request: Request, path: str):
             last_error = failure
             _log(f"[live] provider={provider.name} failure={_compact_error(failure)}")
             await response.aclose()
-            await client.aclose()
             next_provider, env_update_provider = _mark_provider_unhealthy_from_live_failure(
                 provider.name,
                 failure,
@@ -1481,7 +1485,7 @@ async def proxy_handler(request: Request, path: str):
 
         proxy_headers = _sanitize_response_headers(response.headers)
         return StreamingResponse(
-            _proxy_stream_generator(client, response),
+            _proxy_stream_generator(response),
             status_code=response.status_code,
             headers=proxy_headers,
         )
@@ -1724,6 +1728,12 @@ def main() -> int:
         ENV_WRITE_TARGET = None
         PROXY_PUBLIC_BASE_URL = None
         LAST_WRITTEN_ENV = None
+
+    global PROXY_HTTP_CLIENT
+    PROXY_HTTP_CLIENT = httpx.AsyncClient(
+        timeout=120.0,
+        limits=httpx.Limits(max_connections=100, max_keepalive_connections=20),
+    )
 
     try:
         start_probe_async_runtime()
