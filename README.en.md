@@ -125,6 +125,9 @@ python3 proxy_app.py --foreground
   - Includes `Quit` to exit the menubar app.
 
 - Probe strategy in proxy mode:
+  - Each probe creates a fresh HTTP client (no connection reuse) to ensure accurate
+    cold-start latency measurements. The proxy client for live requests uses a persistent
+    connection pool instead.
   - Background probe runs every `60s` (1 minute) by default (`--probe-interval`).
   - Probes cheap-stage providers first (`expensive_only != true`).
   - Probes expensive-stage providers only when all cheap-stage probes fail/timeout.

@@ -107,7 +107,6 @@ PROBE_ASYNC_RUNTIME_LOCK = threading.Lock()
 PROBE_ASYNC_READY = threading.Event()
 PROBE_ASYNC_LOOP: asyncio.AbstractEventLoop | None = None
 PROBE_ASYNC_LOOP_THREAD: threading.Thread | None = None
-PROBE_HTTP_CLIENT: httpx.AsyncClient | None = None
 PROBE_INTERVAL_SECONDS = DEFAULT_PROBE_INTERVAL_SECONDS
 PROBE_ATTEMPTS = DEFAULT_PROBE_ATTEMPTS
 PROBE_TIMEOUT_SECONDS = DEFAULT_PROBE_TIMEOUT_SECONDS
@@ -368,12 +367,11 @@ def start_probe_async_runtime() -> None:
 
 
 def _probe_async_loop_main() -> None:
-    global PROBE_ASYNC_LOOP, PROBE_HTTP_CLIENT
+    global PROBE_ASYNC_LOOP
 
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     PROBE_ASYNC_LOOP = loop
-    PROBE_HTTP_CLIENT = _build_probe_http_client()
     PROBE_ASYNC_READY.set()
     loop.run_forever()
 
@@ -397,34 +395,31 @@ def _build_probe_http_client() -> httpx.AsyncClient:
 async def probe_once_async(provider: Provider) -> tuple[bool, float | None, str | None]:
     url, headers, request_body = _build_probe_request(provider)
 
-    client = PROBE_HTTP_CLIENT
-    if client is None:
-        return False, None, "Probe client not initialized"
-
     start = time.perf_counter()
-    try:
-        response = await client.request(
-            method=provider.test_method,
-            url=url,
-            headers=headers,
-            content=request_body,
-            timeout=PROBE_TIMEOUT_SECONDS,
-        )
-        elapsed_ms = (time.perf_counter() - start) * 1000.0
-        if 200 <= response.status_code < 300:
-            return True, elapsed_ms, None
-        body = response.text[:120].strip()
-        extra = f": {body}" if body else ""
-        return False, elapsed_ms, f"HTTP {response.status_code}{extra}"
-    except httpx.TimeoutException:
-        elapsed_ms = (time.perf_counter() - start) * 1000.0
-        return False, elapsed_ms, "Timeout"
-    except httpx.HTTPError as err:
-        elapsed_ms = (time.perf_counter() - start) * 1000.0
-        return False, elapsed_ms, f"{type(err).__name__}: {err}"
-    except Exception as err:  # pragma: no cover
-        elapsed_ms = (time.perf_counter() - start) * 1000.0
-        return False, elapsed_ms, f"{type(err).__name__}: {err}"
+    async with _build_probe_http_client() as client:
+        try:
+            response = await client.request(
+                method=provider.test_method,
+                url=url,
+                headers=headers,
+                content=request_body,
+                timeout=PROBE_TIMEOUT_SECONDS,
+            )
+            elapsed_ms = (time.perf_counter() - start) * 1000.0
+            if 200 <= response.status_code < 300:
+                return True, elapsed_ms, None
+            body = response.text[:120].strip()
+            extra = f": {body}" if body else ""
+            return False, elapsed_ms, f"HTTP {response.status_code}{extra}"
+        except httpx.TimeoutException:
+            elapsed_ms = (time.perf_counter() - start) * 1000.0
+            return False, elapsed_ms, "Timeout"
+        except httpx.HTTPError as err:
+            elapsed_ms = (time.perf_counter() - start) * 1000.0
+            return False, elapsed_ms, f"{type(err).__name__}: {err}"
+        except Exception as err:  # pragma: no cover
+            elapsed_ms = (time.perf_counter() - start) * 1000.0
+            return False, elapsed_ms, f"{type(err).__name__}: {err}"
 
 
 def resolve_ca_file(user_ca_file: str | None) -> str | None:
