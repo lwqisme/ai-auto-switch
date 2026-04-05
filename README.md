@@ -19,6 +19,7 @@
   - 仅当便宜阶段全部失败或超时时，才探测昂贵阶段提供方
 - 使用归一化后的 `input_price` 和延迟分数对健康提供方排序。
 - 实际请求会路由到当前选中的健康提供方，并在可重试失败时自动切换重试。
+- 支持手动 pin 指定提供方（菜单栏或 HTTP 接口），pin 后关闭自动选主。
 - 默认会把本地代理地址、选中的提供方凭证和模型写入 `~/.gemini/.env`。
 
 ## 配置
@@ -113,9 +114,16 @@ python3 proxy_app.py --write-env ~/.gemini/.env
 python3 proxy_app.py --foreground
 ```
 
+- 启动时直接 pin 到指定 provider：
+
+```bash
+python3 proxy_app.py --pin-provider yunwu-main
+```
+
 - 菜单栏模式下，下拉菜单会显示所有提供方的实时状态：
   - 按评分排序（评分越低越优，未知评分排在后面）
   - 提供 `Probe Interval` 子菜单，可快速切换 `1m`、`5m`、`10m`、`30m`
+  - 提供 `Pin Provider` 子菜单，可切换 `Auto (unpin)` 或手动固定某个 provider
   - 探测进行中时，仅在下拉菜单里显示 `Probing...`
   - `⭐ 🟢 provider score=0.184 123ms`（当前激活且健康的提供方）
   - `  🔴 provider DOWN`（当前不健康）
@@ -144,6 +152,7 @@ python3 proxy_app.py --latency-window 5 --failure-threshold 2
 - 实际请求失败时的切换策略：
   - 如果当前活跃提供方在真实流量中失败（超时、限流、5xx），会立即标记为不健康
   - 代理会重新选择下一个最佳健康提供方，并自动重试同一个请求
+  - 若启用了 pin，代理只会使用被 pin 的 provider；若其不健康，请求会直接失败，直到恢复或手动 unpin
 - 默认日志较为精简，示例如下：
   - `[2026-03-07 14:20:00+0800] [probe-status] WORKING healthy=5/8 selected=foo score=0.1842 latency=132.1ms reason=sticky_keep`
   - `[2026-03-07 14:20:00+0800] [probe-provider] foo=WORKING avg_latency=132.1ms score=0.1842 fails=0`
@@ -171,6 +180,21 @@ python3 proxy_app.py --headless
 
 ```bash
 curl -sS http://127.0.0.1:18080/_health
+```
+
+手动 pin/unpin：
+
+```bash
+# pin 到指定 provider
+curl -sS -X POST http://127.0.0.1:18080/_pin \
+  -H 'content-type: application/json' \
+  -d '{"provider":"yunwu-main"}'
+
+# 查看 pin 状态
+curl -sS http://127.0.0.1:18080/_pin
+
+# 取消 pin（恢复自动选主）
+curl -sS -X DELETE http://127.0.0.1:18080/_pin
 ```
 
 ## 提供方字段

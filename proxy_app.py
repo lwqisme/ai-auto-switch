@@ -97,6 +97,7 @@ RUNTIME_LOCK = threading.Lock()
 RUNTIME_BY_NAME: dict[str, ProviderRuntime] = {}
 RUNTIME_ORDER: list[str] = []
 ACTIVE_PROVIDER_NAME: str | None = None
+PINNED_PROVIDER_NAME: str | None = None
 LAST_PROBE_ERROR: str | None = None
 LAST_PROBE_TIME_UNIX: float | None = None
 PROBER_WAKE_EVENT = threading.Event()
@@ -475,6 +476,47 @@ def set_probe_interval(seconds: float) -> None:
     PROBER_WAKE_EVENT.set()
 
 
+def _set_pinned_provider_locked(name: str | None) -> tuple[bool, str]:
+    global PINNED_PROVIDER_NAME
+
+    if name is None:
+        changed = PINNED_PROVIDER_NAME is not None
+        PINNED_PROVIDER_NAME = None
+        return changed, "auto"
+
+    normalized = name.strip()
+    if not normalized:
+        raise ValueError("Provider name cannot be empty.")
+    if normalized not in RUNTIME_BY_NAME:
+        raise ValueError(f'Unknown provider "{normalized}".')
+
+    changed = PINNED_PROVIDER_NAME != normalized
+    PINNED_PROVIDER_NAME = normalized
+    return changed, normalized
+
+
+def set_pinned_provider(name: str | None) -> tuple[bool, str]:
+    env_update_provider: Provider | None = None
+    with RUNTIME_LOCK:
+        changed, selected_name = _set_pinned_provider_locked(name)
+        selected_runtime, switched, reason = _elect_active_provider_locked()
+        if selected_runtime and (switched or changed):
+            env_update_provider = selected_runtime.provider
+
+    if env_update_provider:
+        maybe_write_proxy_env(env_update_provider)
+
+    if selected_name == "auto":
+        _log(f"[pin] cleared (auto) active={env_update_provider.name if env_update_provider else 'unchanged'}")
+    else:
+        _log(
+            f"[pin] pinned={selected_name} "
+            f"active={env_update_provider.name if env_update_provider else 'unchanged'} "
+            f"reason={reason}"
+        )
+    return changed, reason
+
+
 def start_probe_async(reason: str = "manual") -> bool:
     global PROBE_REQUEST_PENDING
     with RUNTIME_LOCK:
@@ -759,6 +801,14 @@ def parse_args() -> argparse.Namespace:
             "when --write-env is absent."
         ),
     )
+    parser.add_argument(
+        "--pin-provider",
+        default=None,
+        help=(
+            "Pin routing to this provider name at startup "
+            "(disables auto selection until unpinned)."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -807,6 +857,8 @@ def launch_background_process(args: argparse.Namespace) -> int:
         cmd.extend(["--write-env", args.write_env])
     if args.no_auto_write:
         cmd.append("--no-auto-write")
+    if args.pin_provider:
+        cmd.extend(["--pin-provider", args.pin_provider])
 
     with log_path.open("ab") as log_fp:
         process = subprocess.Popen(
@@ -919,6 +971,21 @@ def _elect_active_provider_locked() -> tuple[ProviderRuntime | None, bool, str]:
     healthy_names = {item.provider.name for item in healthy}
     previous_name = ACTIVE_PROVIDER_NAME
     previous = RUNTIME_BY_NAME.get(previous_name) if previous_name else None
+    pinned_name = PINNED_PROVIDER_NAME
+
+    if pinned_name:
+        pinned_runtime = RUNTIME_BY_NAME.get(pinned_name)
+        if not pinned_runtime:
+            ACTIVE_PROVIDER_NAME = None
+            changed = previous_name is not None
+            return None, changed, "pinned_missing"
+        if pinned_runtime.is_healthy and pinned_runtime.moving_avg_latency_ms is not None:
+            ACTIVE_PROVIDER_NAME = pinned_name
+            changed = previous_name != pinned_name
+            return pinned_runtime, changed, "pinned"
+        ACTIVE_PROVIDER_NAME = None
+        changed = previous_name is not None
+        return None, changed, "pinned_unhealthy"
 
     if not healthy:
         ACTIVE_PROVIDER_NAME = None
@@ -961,6 +1028,7 @@ def _initialize_runtime(providers: list[ProviderRuntime]) -> None:
     global RUNTIME_BY_NAME
     global RUNTIME_ORDER
     global ACTIVE_PROVIDER_NAME
+    global PINNED_PROVIDER_NAME
     global LAST_PROBE_ERROR
     global LAST_PROBE_TIME_UNIX
     global USE_EXPENSIVE_FALLBACK_ONLY
@@ -969,6 +1037,7 @@ def _initialize_runtime(providers: list[ProviderRuntime]) -> None:
         RUNTIME_BY_NAME = {item.provider.name: item for item in providers}
         RUNTIME_ORDER = [item.provider.name for item in providers]
         ACTIVE_PROVIDER_NAME = None
+        PINNED_PROVIDER_NAME = None
         LAST_PROBE_ERROR = None
         LAST_PROBE_TIME_UNIX = None
         USE_EXPENSIVE_FALLBACK_ONLY = False
@@ -980,12 +1049,13 @@ def _log_probe_cycle(result_by_name: dict[str, tuple[bool, float | None, str | N
         healthy = [item for item in _healthy_runtimes_locked()]
         active = RUNTIME_BY_NAME.get(ACTIVE_PROVIDER_NAME) if ACTIVE_PROVIDER_NAME else None
 
-        if active and active.balance_score is not None:
+        if active:
+            score_text = f"{active.balance_score:.4f}" if active.balance_score is not None else "-"
             _log(
                 "[probe-status] WORKING "
                 f"healthy={len(healthy)}/{total} "
                 f"selected={active.provider.name} "
-                f"score={active.balance_score:.4f} "
+                f"score={score_text} "
                 f"latency={_format_ms(active.moving_avg_latency_ms)} "
                 f"reason={selection_reason}"
             )
@@ -1101,6 +1171,7 @@ async def _run_probe_once_impl() -> Provider | None:
     with RUNTIME_LOCK:
         names = list(RUNTIME_ORDER)
         provider_by_name = {name: RUNTIME_BY_NAME[name].provider for name in names}
+        pinned_name = PINNED_PROVIDER_NAME
         cheap_names = [name for name in names if not provider_by_name[name].expensive_only]
         expensive_names = [name for name in names if provider_by_name[name].expensive_only]
 
@@ -1121,18 +1192,27 @@ async def _run_probe_once_impl() -> Provider | None:
     cheap_success_names = {name for name, (ok, _, _) in cheap_results.items() if ok}
 
     run_expensive_fallback = not cheap_success_names and bool(expensive_names)
+    probe_pinned_expensive = bool(
+        pinned_name
+        and pinned_name in expensive_names
+        and pinned_name not in cheap_success_names
+        and not run_expensive_fallback
+    )
     expensive_results: dict[str, tuple[bool, float | None, str | None]] = {}
     expensive_success_names: set[str] = set()
 
-    if run_expensive_fallback:
-        stage_reason = "expensive_fallback"
-        expensive_results = await _probe_provider_batch(expensive_names, provider_by_name, deadline)
+    if run_expensive_fallback or probe_pinned_expensive:
+        stage_reason = "expensive_fallback" if run_expensive_fallback else "pinned_expensive_probe"
+        target_expensive_names = expensive_names if run_expensive_fallback else [pinned_name]
+        expensive_results = await _probe_provider_batch(target_expensive_names, provider_by_name, deadline)
         result_by_name.update(expensive_results)
         expensive_success_names = {
             name for name, (ok, _, _) in expensive_results.items() if ok
         }
-    else:
+    if not run_expensive_fallback:
         for name in expensive_names:
+            if name in result_by_name:
+                continue
             result_by_name[name] = (
                 False,
                 None,
@@ -1278,6 +1358,7 @@ def _build_health_payload() -> dict[str, Any]:
                     "balance_score": item.balance_score,
                     "cheap_only": item.provider.cheap_only,
                     "expensive_only": item.provider.expensive_only,
+                    "is_pinned": item.provider.name == PINNED_PROVIDER_NAME,
                 }
             )
 
@@ -1290,6 +1371,7 @@ def _build_health_payload() -> dict[str, Any]:
             "last_probe_latency_ms": active.moving_avg_latency_ms if active else None,
             # New routing metadata.
             "active_provider": active.provider.name if active else None,
+            "pinned_provider": PINNED_PROVIDER_NAME,
             "routing_stage": (
                 "expensive_fallback" if USE_EXPENSIVE_FALLBACK_ONLY else "cheap_primary"
             ),
@@ -1306,7 +1388,7 @@ def _select_provider_for_request() -> tuple[Provider | None, str | None, Provide
     env_update_provider: Provider | None = None
     with RUNTIME_LOCK:
         active = RUNTIME_BY_NAME.get(ACTIVE_PROVIDER_NAME) if ACTIVE_PROVIDER_NAME else None
-        if active and active.is_healthy and _provider_is_eligible_locked(active.provider):
+        if active and active.is_healthy:
             return active.provider, None, None
 
         selected_runtime, changed, selection_reason = _elect_active_provider_locked()
@@ -1409,6 +1491,66 @@ async def _send_request_to_provider(
 @app.get("/_health")
 async def health() -> JSONResponse:
     return JSONResponse(_build_health_payload())
+
+
+@app.get("/_pin")
+async def get_pin() -> JSONResponse:
+    with RUNTIME_LOCK:
+        pinned = PINNED_PROVIDER_NAME
+    return JSONResponse(
+        {
+            "pinned_provider": pinned,
+            "mode": "pinned" if pinned else "auto",
+        }
+    )
+
+
+@app.post("/_pin")
+async def set_pin(request: Request) -> JSONResponse:
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse(
+            {"error": "Request body must be valid JSON: {\"provider\": \"name\"}."},
+            status_code=400,
+        )
+    if not isinstance(body, dict):
+        return JSONResponse(
+            {"error": "Request body must be a JSON object."},
+            status_code=400,
+        )
+
+    raw_provider = body.get("provider")
+    if raw_provider is None:
+        return JSONResponse(
+            {"error": 'Missing required field "provider".'},
+            status_code=400,
+        )
+
+    provider_name = str(raw_provider).strip()
+    if not provider_name:
+        return JSONResponse(
+            {"error": 'Field "provider" cannot be empty.'},
+            status_code=400,
+        )
+
+    try:
+        changed, reason = set_pinned_provider(provider_name)
+    except ValueError as err:
+        return JSONResponse({"error": str(err)}, status_code=404)
+
+    start_probe_async("pin_change")
+    payload = _build_health_payload()
+    payload.update({"changed": changed, "reason": reason, "mode": "pinned"})
+    return JSONResponse(payload)
+
+
+@app.delete("/_pin")
+async def clear_pin() -> JSONResponse:
+    changed, reason = set_pinned_provider(None)
+    payload = _build_health_payload()
+    payload.update({"changed": changed, "reason": reason, "mode": "auto"})
+    return JSONResponse(payload)
 
 
 @app.api_route(
@@ -1515,6 +1657,7 @@ def run_optional_menubar() -> bool:
                 tuple[str, bool, float | None, float | None, float | None, float]
             ],
             active_name: str | None,
+            pinned_name: str | None,
             probe_interval_seconds: float,
             is_probing: bool,
         ) -> None:
@@ -1542,8 +1685,24 @@ def run_optional_menubar() -> bool:
                 item.state = 1 if abs(seconds - probe_interval_seconds) < 1e-9 else 0
                 probe_interval_item.add(item)
             menu_items.append(probe_interval_item)
+
+            pin_title = f"Pin Provider ({pinned_name})" if pinned_name else "Pin Provider (auto)"
+            pin_item = rumps.MenuItem(pin_title, callback=None)
+            auto_pin_item = rumps.MenuItem("Auto (unpin)", callback=self.clear_pin_from_menu)
+            auto_pin_item.state = 1 if pinned_name is None else 0
+            pin_item.add(auto_pin_item)
+            for name, _, _, _, _, _ in provider_snapshots:
+                item = rumps.MenuItem(
+                    name,
+                    callback=lambda _, provider_name=name: self.set_pin_from_menu(provider_name),
+                )
+                item.state = 1 if name == pinned_name else 0
+                pin_item.add(item)
+            menu_items.append(pin_item)
+
             for name, is_healthy, score, avg_latency_ms, last_probe_ts, input_price in provider_snapshots:
-                marker = "⭐" if name == active_name else "  "
+                marker = "⭐" if name == active_name else " "
+                pin_mark = "📌" if name == pinned_name else " "
                 display_name = f"{name} ({input_price:g})"
                 if is_healthy:
                     status = "🟢"
@@ -1559,7 +1718,7 @@ def run_optional_menubar() -> bool:
                     status = "🔴"
                     detail = "DOWN"
                 menu_items.append(
-                    rumps.MenuItem(f"{marker} {status} {display_name} {detail}", callback=None)
+                    rumps.MenuItem(f"{marker}{pin_mark} {status} {display_name} {detail}", callback=None)
                 )
 
             menu_items.append(rumps.MenuItem("Status in terminal", callback=None))
@@ -1574,6 +1733,7 @@ def run_optional_menubar() -> bool:
                 active = RUNTIME_BY_NAME.get(ACTIVE_PROVIDER_NAME) if ACTIVE_PROVIDER_NAME else None
                 error = LAST_PROBE_ERROR
                 active_name = ACTIVE_PROVIDER_NAME
+                pinned_name = PINNED_PROVIDER_NAME
                 probe_interval_seconds = PROBE_INTERVAL_SECONDS
                 is_probing = PROBE_IN_PROGRESS or PROBE_REQUEST_PENDING
                 provider_snapshots = [
@@ -1591,15 +1751,20 @@ def run_optional_menubar() -> bool:
             self._build_menu(
                 provider_snapshots,
                 active_name,
+                pinned_name,
                 probe_interval_seconds,
                 is_probing,
             )
 
             if active:
                 if active.moving_avg_latency_ms is not None:
-                    self.title = f"🤖 {active.provider.name} ({int(active.moving_avg_latency_ms)}ms)"
+                    pinned_prefix = "📌 " if active.provider.name == pinned_name else ""
+                    self.title = (
+                        f"🤖 {pinned_prefix}{active.provider.name} ({int(active.moving_avg_latency_ms)}ms)"
+                    )
                 else:
-                    self.title = f"🤖 {active.provider.name}"
+                    pinned_prefix = "📌 " if active.provider.name == pinned_name else ""
+                    self.title = f"🤖 {pinned_prefix}{active.provider.name}"
             elif error:
                 self.title = "🤖 Error"
             else:
@@ -1611,6 +1776,19 @@ def run_optional_menubar() -> bool:
 
         def set_probe_interval_from_menu(self, seconds: float):
             set_probe_interval(seconds)
+            self._refresh_title()
+
+        def set_pin_from_menu(self, provider_name: str):
+            try:
+                set_pinned_provider(provider_name)
+            except ValueError as err:
+                _log(f"[pin] failed from menubar: {err}")
+                return
+            start_probe_async("pin_change")
+            self._refresh_title()
+
+        def clear_pin_from_menu(self, _):
+            set_pinned_provider(None)
             self._refresh_title()
 
         def quit_app(self, _):
@@ -1643,6 +1821,7 @@ def main() -> int:
     global ENV_WRITE_TARGET
     global PROXY_PUBLIC_BASE_URL
     global LAST_WRITTEN_ENV
+    global PINNED_PROVIDER_NAME
 
     args = parse_args()
     if args.headless and args.menubar:
@@ -1683,6 +1862,17 @@ def main() -> int:
         _log(f"Failed to load providers: {err}")
         return 2
     _initialize_runtime(runtimes)
+    if args.pin_provider:
+        requested_pin = args.pin_provider.strip()
+        if not requested_pin:
+            _log("--pin-provider cannot be empty")
+            return 2
+        with RUNTIME_LOCK:
+            if requested_pin not in RUNTIME_BY_NAME:
+                _log(f'--pin-provider "{requested_pin}" not found in providers config.')
+                return 2
+            PINNED_PROVIDER_NAME = requested_pin
+        _log(f"[pin] startup pinned provider={requested_pin}")
 
     PROBE_INTERVAL_SECONDS = args.probe_interval
     PROBE_ATTEMPTS = args.probe_attempts

@@ -21,6 +21,7 @@ Defaults are split:
   - probes expensive-stage providers only when all cheap-stage probes fail/timeout
 - Ranks healthy providers by normalized `input_price` + latency score.
 - Routes live requests to the selected healthy provider and retries on retryable failures.
+- Supports manual provider pinning (menubar or HTTP API); pin mode disables auto election.
 - Auto-updates `~/.gemini/.env` by default with local proxy URL + selected provider creds/model.
 
 ## Config
@@ -115,9 +116,16 @@ python3 proxy_app.py --write-env ~/.gemini/.env
 python3 proxy_app.py --foreground
 ```
 
+- Pin to a provider at startup:
+
+```bash
+python3 proxy_app.py --pin-provider yunwu-main
+```
+
 - In menubar mode, the dropdown shows every provider with simple live status:
   - Rows are sorted by score (lowest/best first; unknown score at bottom).
   - Includes a `Probe Interval` submenu with live presets (`1m`, `5m`, `10m`, `30m`).
+  - Includes a `Pin Provider` submenu (`Auto (unpin)` or a specific provider).
   - Shows `Probing...` only inside the dropdown while a probe cycle is running.
   - `⭐ 🟢 provider score=0.184 123ms` (active healthy provider)
   - `  🔴 provider DOWN` (currently unhealthy)
@@ -150,6 +158,8 @@ python3 proxy_app.py --latency-window 5 --failure-threshold 2
   - If active provider fails on real traffic (timeout, rate-limit, 5xx), it is immediately
     marked unhealthy.
   - Proxy re-elects the next best healthy provider and retries the same request automatically.
+  - In pin mode, requests only use the pinned provider. If it becomes unhealthy, requests fail
+    until it recovers or you unpin.
 - Default logs are concise status lines:
   - `[2026-03-07 14:20:00+0800] [probe-status] WORKING healthy=5/8 selected=foo score=0.1842 latency=132.1ms reason=sticky_keep`
   - `[2026-03-07 14:20:00+0800] [probe-provider] foo=WORKING avg_latency=132.1ms score=0.1842 fails=0`
@@ -177,6 +187,21 @@ Health check:
 
 ```bash
 curl -sS http://127.0.0.1:18080/_health
+```
+
+Manual pin/unpin:
+
+```bash
+# pin to a specific provider
+curl -sS -X POST http://127.0.0.1:18080/_pin \
+  -H 'content-type: application/json' \
+  -d '{"provider":"yunwu-main"}'
+
+# show pin status
+curl -sS http://127.0.0.1:18080/_pin
+
+# clear pin (back to auto election)
+curl -sS -X DELETE http://127.0.0.1:18080/_pin
 ```
 
 ## Provider Fields
